@@ -917,7 +917,13 @@ export async function discoverProxyModels(
 			}
 			headers = h;
 			return (await res.json()) as {
-				data?: Array<{ id?: string; name?: string; supported_endpoint_types?: string[]; context_length?: number }>;
+				data?: Array<{
+					id?: string;
+					name?: string;
+					supported_endpoint_types?: string[];
+					context_length?: number;
+					capabilities?: { contextWindow?: number; maxOutput?: number };
+				}>;
 			};
 		});
 	const apiKey = await ctx.getBearerApiKeyResolver(providerConfig.provider);
@@ -938,6 +944,10 @@ export async function discoverProxyModels(
 		if (!api) continue;
 		const isAnthropic = api === "anthropic-messages";
 		const reference = resolveModelReference(id, getBundledModelReferenceIndex());
+		const reportedContextWindow =
+			toPositiveNumberOrUndefined(item.context_length) ??
+			toPositiveNumberOrUndefined(item.capabilities?.contextWindow);
+		const reportedMaxTokens = toPositiveNumberOrUndefined(item.capabilities?.maxOutput);
 		const discoveryName = typeof item.name === "string" ? item.name.trim() : "";
 		const displayName =
 			reference?.name ??
@@ -960,11 +970,8 @@ export async function discoverProxyModels(
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				// Prefer the context_length the API reports for this model; fall
 				// back to the bundled reference, then a sane default.
-				contextWindow:
-					toPositiveNumberOrUndefined(item.context_length) ??
-					reference?.contextWindow ??
-					DISCOVERY_DEFAULT_CONTEXT_WINDOW,
-				maxTokens: reference?.maxTokens ?? discoveryDefaultMaxTokens(api),
+				contextWindow: reportedContextWindow ?? reference?.contextWindow ?? DISCOVERY_DEFAULT_CONTEXT_WINDOW,
+				maxTokens: reportedMaxTokens ?? reference?.maxTokens ?? discoveryDefaultMaxTokens(api),
 				headers,
 				// OpenAI-compat fields are no-ops on anthropic models; the
 				// Anthropic SDK ignores them. Provider-level disableStrictTools
