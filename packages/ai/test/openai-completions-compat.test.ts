@@ -112,10 +112,41 @@ function kimiZaiModel(): Model<"openai-completions"> {
 	} as ModelSpec<"openai-completions">);
 }
 
+function merlinKimiModel(
+	id: string,
+	options: {
+		name?: string;
+		maxTokens?: number;
+		thinking?: ModelSpec<"openai-completions">["thinking"];
+	} = {},
+): Model<"openai-completions"> {
+	return buildModel({
+		...gpt4oMiniSpec,
+		api: "openai-completions",
+		provider: "merlin-9router",
+		baseUrl: "https://merlin.loldinis.com/v1",
+		id,
+		name: options.name ?? id,
+		reasoning: true,
+		contextWindow: 1_048_576,
+		maxTokens: options.maxTokens ?? 131_072,
+		thinking: options.thinking,
+		compat: {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: false,
+		},
+	} satisfies ModelSpec<"openai-completions">);
+}
+
 async function captureOpenAICompletionsPayload(
 	model: Model<"openai-completions">,
 	context: Context = baseContext(),
-	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; temperature?: number },
+	options?: {
+		reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+		temperature?: number;
+		toolChoice?: { type: "tool"; name: string };
+	},
 ): Promise<unknown> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
 	const fetchMock = createMockFetch(["[DONE]"]);
@@ -2090,6 +2121,87 @@ describe("kimi model detection via detectCompat", () => {
 		} as ModelSpec<"openai-completions">);
 		const compat = model.compat;
 		expect(compat.requiresReasoningContentForToolCalls).toBe(true);
+	});
+});
+
+describe("Merlin 9Router Kimi harness", () => {
+	const k3Thinking: ModelSpec<"openai-completions">["thinking"] = {
+		mode: "effort",
+		efforts: [Effort.Low, Effort.High, Effort.Max],
+		defaultLevel: Effort.Max,
+		requiresEffort: true,
+	};
+
+	it.each(["kimi/kimi-k3", "kimi/k3"])("uses the Kimi Code K3 wire contract for %s", async id => {
+		const model = merlinKimiModel(id, { thinking: k3Thinking });
+		expect(model.compat).toMatchObject({
+			thinkingFormat: "kimi",
+			reasoningDisableMode: "zai-thinking-disabled",
+			disableReasoningOnForcedToolChoice: false,
+			streamIdleTimeoutMs: 300_000,
+			alwaysSendMaxTokens: true,
+		});
+		expect(model.compat.reasoningEffortMap).toMatchObject({ minimal: "low", medium: "high", xhigh: "max" });
+
+		const payload = await captureOpenAICompletionsPayload(model, baseContext(), { reasoning: "max" });
+		expect(getNestedObject(payload, "thinking")).toEqual({ type: "enabled", effort: "max" });
+		expect(toObject(payload)?.reasoning_effort).toBeUndefined();
+		expect(toObject(payload)?.max_tokens).toBe(131_072);
+		expect(toObject(payload)?.max_completion_tokens).toBeUndefined();
+
+		const forcedToolPayload = await captureOpenAICompletionsPayload(
+			model,
+			{
+				...baseContext(),
+				tools: [{ name: "plan", description: "Plan", parameters: { type: "object", properties: {} } }],
+			},
+			{ reasoning: "max", toolChoice: { type: "tool", name: "plan" } },
+		);
+		expect(toObject(forcedToolPayload)?.tool_choice).toBe("required");
+		expect(getNestedObject(forcedToolPayload, "thinking")).toEqual({ type: "enabled", effort: "max" });
+	});
+
+	it("preserves K2.6 thinking across tool continuations", async () => {
+		const model = merlinKimiModel("kimi/kimi-k2.6", { maxTokens: 262_144 });
+		expect(model.compat).toMatchObject({
+			thinkingFormat: "zai",
+			thinkingKeep: "all",
+			requiresReasoningContentForToolCalls: true,
+			disableReasoningOnForcedToolChoice: true,
+			streamIdleTimeoutMs: 300_000,
+		});
+
+		const payload = await captureOpenAICompletionsPayload(model, baseContext(), { reasoning: "high" });
+		expect(getNestedObject(payload, "thinking")).toEqual({ type: "enabled", keep: "all" });
+	});
+
+	it.each(["kimi/kimi-k2.7-code", "kimi/kimi-for-coding", "kimi/kimi-for-coding-highspeed"])(
+		"keeps mandatory thinking compatible with K2.7 tools for %s",
+		id => {
+			const model = merlinKimiModel(id, { name: "K2.7 Code" });
+			expect(model.compat.thinkingFormat).toBe("zai");
+			expect(model.compat.reasoningDisableMode).toBe("omit");
+			expect(model.compat.supportsForcedToolChoice).toBe(false);
+			expect(model.compat.streamIdleTimeoutMs).toBe(300_000);
+		},
+	);
+
+	it("does not affect non-Kimi Merlin routes or the same namespace on another provider", () => {
+		const merlinCursor = merlinKimiModel("cx/kimi-k3", { thinking: k3Thinking });
+		const unrelatedProvider = buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+			provider: "custom-proxy",
+			baseUrl: "https://example.test/v1",
+			id: "kimi/kimi-k3",
+			reasoning: true,
+			thinking: k3Thinking,
+		} satisfies ModelSpec<"openai-completions">);
+
+		expect(merlinCursor.compat.thinkingFormat).toBe("openai");
+		expect(merlinCursor.compat.streamIdleTimeoutMs).toBeUndefined();
+		expect(unrelatedProvider.compat.thinkingFormat).toBe("openai");
+		expect(unrelatedProvider.compat.streamIdleTimeoutMs).toBeUndefined();
 	});
 });
 

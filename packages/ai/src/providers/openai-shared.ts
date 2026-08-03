@@ -1,6 +1,10 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { toFirepassWireModelId, toFireworksWireModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
-import { isGlm52ReasoningEffortModelId, isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
+import {
+	isGlm52ReasoningEffortModelId,
+	isKimiK3ModelId,
+	merlin9RouterKimiModelId,
+} from "@oh-my-pi/pi-catalog/identity";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type {
@@ -1124,7 +1128,11 @@ export function resolveOpenAICompletionsOutputClamp(
 	if (isZaiReasoningEffortDialect(model, compat)) {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
-	if (model.provider === "moonshot" && isKimiK3ModelId(model.id)) {
+	const merlinKimiModelId = merlin9RouterKimiModelId(model.provider, model.id);
+	if (
+		(model.provider === "moonshot" && isKimiK3ModelId(model.id)) ||
+		(merlinKimiModelId !== undefined && isKimiK3ModelId(merlinKimiModelId))
+	) {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
 	return undefined;

@@ -11,6 +11,7 @@ import {
 	isOpenAIGptOssModelId,
 	isOpenAIModelId,
 	isReasoningGlmModelId,
+	merlin9RouterKimiModelId,
 	modelFamilyToken,
 	parseAnthropicModel,
 	supportsAdaptiveThinkingDisplay,
@@ -36,6 +37,15 @@ describe("isKimiK26ModelId", () => {
 		expect(isKimiK26ModelId("accounts/fireworks/routers/kimi-k2p6-turbo")).toBe(true);
 		expect(isKimiK26ModelId("kimi-k2p6")).toBe(true);
 		expect(isKimiK26ModelId("kimi-k2p61")).toBe(false);
+	});
+});
+
+describe("merlin9RouterKimiModelId", () => {
+	test("normalizes only the exact Merlin Kimi route", () => {
+		expect(merlin9RouterKimiModelId("merlin-9router", "kimi/kimi-k2.6")).toBe("kimi-k2.6");
+		expect(merlin9RouterKimiModelId("merlin-9router", "kimi/k3")).toBe("kimi-k3");
+		expect(merlin9RouterKimiModelId("merlin-9router", "cx/kimi-k3")).toBeUndefined();
+		expect(merlin9RouterKimiModelId("openrouter", "kimi/kimi-k3")).toBeUndefined();
 	});
 });
 

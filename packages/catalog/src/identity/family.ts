@@ -52,6 +52,23 @@ export const isKimiK3ModelId = memo((modelId: string): boolean => {
 });
 
 /**
+ * Resolve the upstream Kimi id carried by the private Merlin 9Router route.
+ *
+ * This intentionally requires both the exact provider id and the `kimi/`
+ * namespace. Merlin also serves unrelated model families, so broad provider
+ * or model-name matching here would leak Moonshot wire quirks into them.
+ * The short `k3` alias is normalized to the canonical family shape used by
+ * the existing Kimi classifiers.
+ */
+export function merlin9RouterKimiModelId(provider: string, modelId: string): string | undefined {
+	if (provider !== "merlin-9router") return undefined;
+	const match = /^kimi\/(.+)$/i.exec(modelId);
+	if (!match) return undefined;
+	const upstreamId = match[1];
+	return /^k3(?:\.\d+)?(?:[-.:_]|$)/i.test(upstreamId) ? `kimi-${upstreamId}` : upstreamId;
+}
+
+/**
  * Claude ids in any namespace form: bare (`claude-*`), path-namespaced
  * (`anthropic/claude.x`), or dot-prefixed (`us.anthropic.claude-…`,
  * `global.anthropic.claude-…`, `au.anthropic.claude-…` — Bedrock cross-region

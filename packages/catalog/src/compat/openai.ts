@@ -22,6 +22,7 @@ import {
 	isMimoModelIdOrName,
 	isOpenAISamplingRestrictedModelId,
 	isQwenModelId,
+	merlin9RouterKimiModelId,
 	modelFamilyToken,
 } from "../identity/family";
 import type {
@@ -52,9 +53,9 @@ const KIMI_REASONING_STREAM_IDLE_TIMEOUT_MS = 300_000;
  */
 const KIMI_K27_CODE_MODEL_PATTERN = /(?:^|\/)kimi[-._]?k2(?:[._-]?|p)7[-._]?code(?:[-._]?highspeed)?$/i;
 
-function matchesKimiK27CodeFamily(spec: ModelSpec<"openai-completions">): boolean {
-	if (KIMI_K27_CODE_MODEL_PATTERN.test(spec.id)) return true;
-	return spec.id === "kimi-for-coding" && /k2\.?7 code/i.test(spec.name ?? "");
+function matchesKimiK27CodeFamily(spec: ModelSpec<"openai-completions">, modelId = spec.id): boolean {
+	if (KIMI_K27_CODE_MODEL_PATTERN.test(modelId)) return true;
+	return /^kimi-for-coding(?:-highspeed)?$/i.test(modelId) && /k2\.?7 code/i.test(spec.name ?? "");
 }
 /** Xiaomi MiMo Pro on api.xiaomimimo.com can stall ~2min before the first event (issue #1770). */
 const XIAOMI_MIMO_STREAM_IDLE_TIMEOUT_MS = 300_000;
@@ -282,15 +283,18 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	const isZhipu = modelMatchesHost(hostModel, "zhipu");
 	const supportsZaiReasoningEffort = (isZai || isZhipu) && isGlm52ReasoningEffortModelId(spec.id);
 	const isKilo = modelMatchesHost(hostModel, "kilo");
-	const isKimiModel = isKimiModelId(spec.id);
+	const merlinKimiModelId = merlin9RouterKimiModelId(provider, spec.id);
+	const kimiModelId = merlinKimiModelId ?? spec.id;
+	const isMerlinKimi = merlinKimiModelId !== undefined;
+	const isKimiModel = isKimiModelId(spec.id) || isMerlinKimi;
 	const isMoonshotNative = modelMatchesHost(hostModel, "moonshotNative");
-	const isMoonshotKimi = isKimiModel && isMoonshotNative;
+	const isMoonshotKimi = isKimiModel && (isMoonshotNative || isMerlinKimi);
 	// Native Kimi K3 uses OpenAI-style `reasoning_effort` with mandatory
 	// low/high/max thinking, not the K2.x binary `thinking: { type }` block.
-	const isKimiK3 = isKimiK3ModelId(spec.id);
+	const isKimiK3 = isKimiK3ModelId(kimiModelId);
 	const isMoonshotKimiK3 = isMoonshotKimi && isKimiK3;
-	const requiresEnabledThinking = isMoonshotKimi && matchesKimiK27CodeFamily(spec);
-	const usesMoonshotKimiPreservedThinking = isMoonshotKimi && isKimiK26ModelId(spec.id);
+	const requiresEnabledThinking = isMoonshotKimi && matchesKimiK27CodeFamily(spec, kimiModelId);
+	const usesMoonshotKimiPreservedThinking = isMoonshotKimi && isKimiK26ModelId(kimiModelId);
 	const isAnthropicModel =
 		modelMatchesHost(hostModel, "anthropic") || isClaudeModelId(spec.id) || isAnthropicNamespacedModelId(spec.id);
 	const isAlibaba = modelMatchesHost(hostModel, "alibabaDashscope");
@@ -358,6 +362,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	const useMaxTokens =
 		isMistral ||
 		isMoonshotNative ||
+		isMerlinKimi ||
 		isZai ||
 		isZhipu ||
 		hostMatchesUrl(baseUrl, "chutes") ||
@@ -421,9 +426,9 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 				: isXiaomiMimo
 					? XIAOMI_MIMO_STREAM_IDLE_TIMEOUT_MS
 					: spec.reasoning &&
-							(isKimiK26ModelId(spec.id) ||
+							(isKimiK26ModelId(kimiModelId) ||
 								isMoonshotKimiK3 ||
-								(isMoonshotKimi && matchesKimiK27CodeFamily(spec)))
+								(isMoonshotKimi && matchesKimiK27CodeFamily(spec, kimiModelId)))
 						? KIMI_REASONING_STREAM_IDLE_TIMEOUT_MS
 						: spec.reasoning && isDirectDeepseekApi
 							? DEEPSEEK_REASONING_STREAM_IDLE_TIMEOUT_MS
@@ -444,17 +449,19 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 					? "openrouter"
 					: "raw";
 	const thinkingFormat: ResolvedOpenAISharedCompat["thinkingFormat"] =
-		(isMoonshotKimi && !isMoonshotKimiK3) || isZai || isZhipu || isXiaomiMimo
-			? "zai"
-			: isOpenRouter
-				? "openrouter"
-				: isQwen && isNvidiaNim
-					? "qwen-chat-template"
-					: isQwen && isFireworks
-						? "openai"
-						: isAlibaba || isQwen
-							? "qwen"
-							: "openai";
+		isMerlinKimi && isMoonshotKimiK3
+			? "kimi"
+			: (isMoonshotKimi && !isMoonshotKimiK3) || isZai || isZhipu || isXiaomiMimo
+				? "zai"
+				: isOpenRouter
+					? "openrouter"
+					: isQwen && isNvidiaNim
+						? "qwen-chat-template"
+						: isQwen && isFireworks
+							? "openai"
+							: isAlibaba || isQwen
+								? "qwen"
+								: "openai";
 
 	const compat: ResolvedOpenAICompat = {
 		supportsStore: !isNonStandard,
@@ -612,7 +619,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	if (spec.compat?.omitReasoningEffort === undefined && !compat.supportsReasoningEffort) {
 		compat.omitReasoningEffort = true;
 	}
-	mergeModelReasoningEffortMap(compat, spec.id, isMimoReasoningEffortModel);
+	mergeModelReasoningEffortMap(compat, kimiModelId, isMimoReasoningEffortModel);
 
 	const whenThinkingPolicy =
 		spec.compat?.whenThinking ?? (isOpenCodeProvider && spec.reasoning ? OPENCODE_WHEN_THINKING : undefined);
@@ -625,7 +632,7 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		if (whenThinkingPolicy.omitReasoningEffort === undefined && !variant.supportsReasoningEffort) {
 			variant.omitReasoningEffort = true;
 		}
-		mergeModelReasoningEffortMap(variant, spec.id, isMimoReasoningEffortModel);
+		mergeModelReasoningEffortMap(variant, kimiModelId, isMimoReasoningEffortModel);
 		compat.whenThinking = variant;
 	}
 

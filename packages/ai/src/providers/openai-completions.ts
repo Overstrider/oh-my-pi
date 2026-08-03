@@ -1,5 +1,5 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { isKimiModelId } from "@oh-my-pi/pi-catalog/identity";
+import { isKimiK3ModelId, isKimiModelId, merlin9RouterKimiModelId } from "@oh-my-pi/pi-catalog/identity";
 import { resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
@@ -1447,12 +1447,16 @@ function dropOpenRouterKimiForcedToolReasoning(
 	}
 }
 
-function hasActiveNativeKimiK3Reasoning(
+function hasActiveKimiCodeWireK3Reasoning(
 	model: Model<"openai-completions">,
 	options: OpenAICompletionsOptions | undefined,
 ): boolean {
-	if (model.provider !== "kimi-code" || model.id.toLowerCase() !== "k3" || !model.reasoning) return false;
+	const merlinKimiModelId = merlin9RouterKimiModelId(model.provider, model.id);
+	const isMerlinKimiK3 = merlinKimiModelId !== undefined && isKimiK3ModelId(merlinKimiModelId);
+	const isKimiCodeK3 = model.provider === "kimi-code" && model.id.toLowerCase() === "k3";
+	if ((!isKimiCodeK3 && !isMerlinKimiK3) || !model.reasoning) return false;
 	if (options?.reasoning === undefined || options.disableReasoning) return false;
+	if (isMerlinKimiK3) return true;
 	try {
 		const url = new URL(model.baseUrl);
 		return url.hostname === "api.kimi.com" && (url.pathname === "/coding" || url.pathname.startsWith("/coding/"));
@@ -1640,7 +1644,7 @@ function buildParams(
 		forcedToolName !== undefined &&
 		Array.isArray(params.tools) &&
 		params.tools.some(tool => tool.type === "function" && tool.function.name === forcedToolName) &&
-		hasActiveNativeKimiK3Reasoning(model, options)
+		hasActiveKimiCodeWireK3Reasoning(model, options)
 	) {
 		// Native K3 reasoning is incompatible with selecting a specific function.
 		// Preserve the hard tool-use contract while letting K3 choose among tools.
