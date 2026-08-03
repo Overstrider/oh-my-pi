@@ -77,11 +77,15 @@ import {
  */
 async function dispatchExec(
 	message: ExecServerMessage,
-	options: { execHandlers?: CursorExecHandlers; requestContextTools?: McpToolDefinition[] } = {},
+	options: {
+		execHandlers?: CursorExecHandlers;
+		requestContextTools?: McpToolDefinition[];
+		state?: BlockState;
+	} = {},
 ): Promise<{ frames: AgentClientMessage[]; output: AssistantMessage; results: ToolResultMessage[] }> {
 	const output = cursorAssistantMessage();
 	const stream = new AssistantMessageEventStream();
-	const state = newBlockState();
+	const state = options.state ?? newBlockState();
 	const written: Buffer[] = [];
 	const h2Request = {
 		write: (chunk: Buffer) => {
@@ -792,6 +796,70 @@ describe("Cursor MCP resource frames answer from the host's servers", () => {
 		expect(blocks[0].name).toBe("list_mcp_resources");
 		expect(results.map(r => r.toolCallId)).toEqual([blocks[0].id]);
 		expect(results[0].isError).toBe(false);
+	});
+
+	it("replays a completed resource download without writing it twice", async () => {
+		const message = buildExecMessage({
+			case: "readMcpResourceExecArgs",
+			value: create(ReadMcpResourceExecArgsSchema, {
+				server: "docs",
+				uri: "docs://readme",
+				downloadPath: "assets/readme.md",
+			}),
+		});
+		let downloads = 0;
+		const execHandlers: CursorExecHandlers = {
+			readMcpResource: async ({ uri, downloadPath }) => {
+				downloads++;
+				return { uri, mimeType: "text/markdown", downloadPath };
+			},
+		};
+		const first = await dispatchExec(message, { execHandlers });
+		const block = first.output.content.find((item): item is ToolCallState => item.type === "toolCall");
+		if (!block || !first.results[0]) throw new Error("expected a paired resource download");
+
+		const replay = await dispatchExec(message, {
+			execHandlers,
+			state: newBlockState({ resolvedContextToolResults: new Map([[block.id, first.results[0]]]) }),
+		});
+		const answer = soleResult(replay.frames);
+		if (answer.case !== "readMcpResourceExecResult") throw new Error(`got ${answer.case}`);
+		if (answer.value.result.case !== "success") throw new Error(`got ${answer.value.result.case}`);
+
+		expect(downloads).toBe(1);
+		expect(answer.value.result.value.downloadPath).toBe("assets/readme.md");
+		expect(replay.output.content).toHaveLength(0);
+		expect(replay.results).toHaveLength(0);
+	});
+
+	it("replays a completed resource listing without querying the server twice", async () => {
+		const message = buildExecMessage({
+			case: "listMcpResourcesExecArgs",
+			value: create(ListMcpResourcesExecArgsSchema, { server: "docs" }),
+		});
+		let listings = 0;
+		const execHandlers: CursorExecHandlers = {
+			listMcpResources: async () => {
+				listings++;
+				return [{ uri: "docs://readme", name: "README", mimeType: "text/markdown", server: "docs" }];
+			},
+		};
+		const first = await dispatchExec(message, { execHandlers });
+		const block = first.output.content.find((item): item is ToolCallState => item.type === "toolCall");
+		if (!block || !first.results[0]) throw new Error("expected a paired resource listing");
+
+		const replay = await dispatchExec(message, {
+			execHandlers,
+			state: newBlockState({ resolvedContextToolResults: new Map([[block.id, first.results[0]]]) }),
+		});
+		const answer = soleResult(replay.frames);
+		if (answer.case !== "listMcpResourcesExecResult") throw new Error(`got ${answer.case}`);
+		if (answer.value.result.case !== "success") throw new Error(`got ${answer.value.result.case}`);
+
+		expect(listings).toBe(1);
+		expect(answer.value.result.value.resources.map(resource => resource.uri)).toEqual(["docs://readme"]);
+		expect(replay.output.content).toHaveLength(0);
+		expect(replay.results).toHaveLength(0);
 	});
 
 	it("leaves no block for a listing no handler answered", async () => {

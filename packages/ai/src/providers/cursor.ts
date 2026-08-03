@@ -158,6 +158,8 @@ import type {
 	CursorExecHandlers,
 	CursorExecPairing,
 	CursorMcpCall,
+	CursorMcpResource,
+	CursorMcpResourceContent,
 	CursorShellStreamCallbacks,
 	CursorTodoSnapshot,
 	CursorTodoSnapshotItem,
@@ -1699,58 +1701,41 @@ async function handleExecServerMessage(
 			// result or the listing is invisible in the UI and gone from every
 			// rebuilt history. Only synthesized when a handler exists: without
 			// one the frame is a fixed empty answer that executed nothing.
-			const toolCallId = execHandlers?.listMcpResources ? stableCursorExecToolCallId(execMsg) : undefined;
+			const listMcpResources = execHandlers?.listMcpResources;
+			const toolCallId = listMcpResources ? stableCursorExecToolCallId(execMsg) : undefined;
 			if (toolCallId) {
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "list_mcp_resources", {
 					server: args.server,
 				});
 			}
-			try {
-				const resources = (await execHandlers?.listMcpResources?.({ server: args.server })) ?? [];
-				execResult = create(ListMcpResourcesExecResultSchema, {
-					result: {
-						case: "success",
-						value: create(ListMcpResourcesSuccessSchema, {
-							resources: resources.map(resource =>
-								create(ListMcpResourcesExecResult_McpResourceSchema, {
-									uri: resource.uri,
-									name: resource.name,
-									description: resource.description,
-									mimeType: resource.mimeType,
-									server: resource.server,
-								}),
+			if (!toolCallId || !listMcpResources) {
+				execResult = buildListMcpResourcesResult([]);
+			} else {
+				const resolved = await resolveExecHandler<{ server?: string }, ListMcpResourcesExecResult>(
+					{ server: args.server },
+					async ({ server }) => {
+						const resources = await listMcpResources({ server });
+						const result = buildListMcpResourcesResult(resources);
+						return {
+							result,
+							toolResult: synthesizedExecToolResult(
+								toolCallId,
+								"list_mcp_resources",
+								formatListedMcpResources(result.result.case === "success" ? result.result.value.resources : []),
+								false,
 							),
-						}),
+						};
 					},
-				});
-			} catch (error) {
-				execResult = create(ListMcpResourcesExecResultSchema, {
-					result: {
-						case: "error",
-						value: create(ListMcpResourcesErrorSchema, {
-							error: error instanceof Error ? error.message : String(error),
-						}),
-					},
-				});
-			}
-			if (toolCallId) {
-				// Derived from the answer that goes on the wire, so the block can
-				// never disagree with what the model was told.
-				const settled = execResult.result;
-				const text =
-					settled.case === "success"
-						? formatListedMcpResources(settled.value.resources)
-						: settled.case === "error"
-							? settled.value.error || "Failed to list MCP resources"
-							: (settled.value?.reason ?? "Failed to list MCP resources");
-				await pairSynthesizedExecResult(
-					state,
 					onToolResult,
-					toolCallId,
-					"list_mcp_resources",
-					text,
-					settled.case !== "success",
+					toolResult =>
+						toolResult.isError
+							? buildListMcpResourcesError(toolResultToText(toolResult))
+							: buildListMcpResourcesResult([]),
+					buildListMcpResourcesError,
+					buildListMcpResourcesError,
+					cursorExecResolution(state, toolCallId, "list_mcp_resources"),
 				);
+				execResult = resolved.execResult;
 			}
 			sendExecClientMessage(h2Request, execMsg, "listMcpResourcesExecResult", execResult);
 			return;
@@ -1763,13 +1748,42 @@ async function handleExecServerMessage(
 			// and absent from every rebuilt history. Only synthesized when a
 			// handler exists: without one the frame is a fixed `not_found` that
 			// executed nothing, and a block would claim work that never happened.
-			const toolCallId = execHandlers?.readMcpResource ? stableCursorExecToolCallId(execMsg) : undefined;
-			if (toolCallId) {
+			const readMcpResource = execHandlers?.readMcpResource;
+			const toolCallId = readMcpResource ? stableCursorExecToolCallId(execMsg) : undefined;
+			if (toolCallId && readMcpResource) {
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read_mcp_resource", {
 					server: args.server,
 					uri: args.uri,
 					download_path: args.downloadPath,
 				});
+				const resolved = await resolveExecHandler<
+					{ server: string; uri: string; downloadPath?: string },
+					ReadMcpResourceExecResult
+				>(
+					{ server: args.server, uri: args.uri, downloadPath: args.downloadPath },
+					async request => {
+						const content = await readMcpResource(request);
+						const result = buildReadMcpResourceResult(args.uri, content);
+						const [text, isError] = describeReadMcpResourceResult(args.uri, result);
+						return {
+							result,
+							toolResult: synthesizedExecToolResult(toolCallId, "read_mcp_resource", text, isError),
+						};
+					},
+					onToolResult,
+					toolResult =>
+						toolResult.isError
+							? buildReadMcpResourceError(args.uri, toolResultToText(toolResult))
+							: buildReadMcpResourceResult(args.uri, {
+									uri: args.uri,
+									downloadPath: args.downloadPath,
+								}),
+					reason => buildReadMcpResourceError(args.uri, reason),
+					error => buildReadMcpResourceError(args.uri, error),
+					cursorExecResolution(state, toolCallId, "read_mcp_resource"),
+				);
+				sendExecClientMessage(h2Request, execMsg, "readMcpResourceExecResult", resolved.execResult);
+				return;
 			}
 			try {
 				// `null` is the handler's "no such server or uri", which is exactly
@@ -2513,6 +2527,104 @@ async function applyToolResultHandler(
 
 function toolResultToText(toolResult: ToolResultMessage): string {
 	return toolResult.content.map(item => (item.type === "text" ? item.text : `[${item.mimeType} image]`)).join("\n");
+}
+
+function synthesizedExecToolResult(
+	toolCallId: string,
+	toolName: string,
+	text: string,
+	isError: boolean,
+): ToolResultMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName,
+		content: [{ type: "text", text }],
+		isError,
+		timestamp: Date.now(),
+	};
+}
+
+function buildListMcpResourcesResult(resources: CursorMcpResource[]): ListMcpResourcesExecResult {
+	return create(ListMcpResourcesExecResultSchema, {
+		result: {
+			case: "success",
+			value: create(ListMcpResourcesSuccessSchema, {
+				resources: resources.map(resource =>
+					create(ListMcpResourcesExecResult_McpResourceSchema, {
+						uri: resource.uri,
+						name: resource.name,
+						description: resource.description,
+						mimeType: resource.mimeType,
+						server: resource.server,
+					}),
+				),
+			}),
+		},
+	});
+}
+
+function buildListMcpResourcesError(error: string): ListMcpResourcesExecResult {
+	return create(ListMcpResourcesExecResultSchema, {
+		result: { case: "error", value: create(ListMcpResourcesErrorSchema, { error }) },
+	});
+}
+
+function buildReadMcpResourceResult(
+	uri: string,
+	content: CursorMcpResourceContent | null | undefined,
+): ReadMcpResourceExecResult {
+	if (!content) {
+		return create(ReadMcpResourceExecResultSchema, {
+			result: { case: "notFound", value: create(ReadMcpResourceNotFoundSchema, { uri }) },
+		});
+	}
+	return create(ReadMcpResourceExecResultSchema, {
+		result: {
+			case: "success",
+			value: create(ReadMcpResourceSuccessSchema, {
+				uri: content.uri,
+				name: content.name,
+				description: content.description,
+				mimeType: content.mimeType,
+				downloadPath: content.downloadPath,
+				content:
+					content.downloadPath !== undefined
+						? { case: undefined }
+						: content.text !== undefined
+							? { case: "text", value: content.text }
+							: content.blob !== undefined
+								? { case: "blob", value: content.blob }
+								: { case: undefined },
+			}),
+		},
+	});
+}
+
+function buildReadMcpResourceError(uri: string, error: string): ReadMcpResourceExecResult {
+	return create(ReadMcpResourceExecResultSchema, {
+		result: { case: "error", value: create(ReadMcpResourceErrorSchema, { uri, error }) },
+	});
+}
+
+function describeReadMcpResourceResult(
+	uri: string,
+	execResult: ReadMcpResourceExecResult,
+): [text: string, isError: boolean] {
+	const settled = execResult.result;
+	switch (settled.case) {
+		case "success":
+			return [
+				settled.value.downloadPath ? `Downloaded ${uri} to ${settled.value.downloadPath}` : `Read ${uri}`,
+				false,
+			];
+		case "notFound":
+			return [`No such resource: ${uri}`, true];
+		case "rejected":
+			return [`Refused: ${settled.value.reason}`, true];
+		default:
+			return [settled.value?.error ?? `Failed to read ${uri}`, true];
+	}
 }
 
 /**
