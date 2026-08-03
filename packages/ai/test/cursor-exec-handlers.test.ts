@@ -355,6 +355,56 @@ describe("Cursor resolveExecHandler execHandlers binding", () => {
 			});
 		});
 
+		it("replays the exact native result behind a synthesized transcript result", async () => {
+			const nativeResult = create(ReadResultSchema, {
+				result: {
+					case: "success",
+					value: create(ReadSuccessSchema, {
+						path: "/tmp/foo",
+						output: { case: "content", value: "native file bytes" },
+					}),
+				},
+			});
+			const first = await resolveExecHandler<{ path: string }, ReadResult>(
+				{ path: "/tmp/foo" },
+				async () => nativeResult,
+				undefined,
+				() => {
+					throw new Error("first execution must use the native handler result");
+				},
+				() => create(ReadResultSchema),
+				() => create(ReadResultSchema),
+				pairing,
+			);
+			if (!first.toolResult) throw new Error("expected a paired transcript result");
+
+			let repeatedExecutions = 0;
+			const replay = await resolveExecHandler<{ path: string }, ReadResult>(
+				{ path: "/tmp/foo" },
+				async () => {
+					repeatedExecutions++;
+					return create(ReadResultSchema);
+				},
+				undefined,
+				() =>
+					create(ReadResultSchema, {
+						result: {
+							case: "success",
+							value: create(ReadSuccessSchema, {
+								path: "/tmp/foo",
+								output: { case: "content", value: "lossy transcript reconstruction" },
+							}),
+						},
+					}),
+				() => create(ReadResultSchema),
+				() => create(ReadResultSchema),
+				{ ...pairing, previousResult: first.toolResult },
+			);
+
+			expect(repeatedExecutions).toBe(0);
+			expect(replay.execResult).toBe(nativeResult);
+		});
+
 		it("records an MCP success carrying is_error as a failed call", async () => {
 			// MCP is the one shape where `success` is not enough: an application-level
 			// tool failure rides inside the success variant as `is_error`, mirroring

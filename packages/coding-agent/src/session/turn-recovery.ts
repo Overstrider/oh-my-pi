@@ -1377,7 +1377,7 @@ export class TurnRecovery {
 		// configured chain.
 		const maxRetries = this.#isOpenRouterThinkingStreamClose(message)
 			? Math.min(retrySettings.maxRetries, 1)
-			: message.provider === "cursor"
+			: message.provider === "cursor" && options?.preserveFailedTurn
 				? Math.min(retrySettings.maxRetries, 2)
 				: retrySettings.maxRetries;
 		const retryBudgetExhausted = this.#retryAttempt > maxRetries;

@@ -231,7 +231,12 @@ const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
 const NOT_IMPLEMENTED_SUFFIX = "not implemented by this client";
 const NOT_IMPLEMENTED = `Not implemented by this client`;
 
-const conversationStateCache = new Map<string, ConversationStateStructure>();
+interface ConversationStateCacheEntry {
+	state: ConversationStateStructure;
+	owner: object;
+}
+
+const conversationStateCache = new Map<string, ConversationStateCacheEntry>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 
 export interface CursorOptions extends StreamOptions {
@@ -497,6 +502,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let sawTurnEnded = false;
 		let completedCleanly = false;
 		let conversationId: string | undefined;
+		let conversationStateOwner: object | undefined;
 		let endStreamError: Error | null = null;
 		// Reachable from the catch: a stream that dies mid-turn must still close
 		// and pair the blocks it left open, and `state` itself is scoped to the
@@ -532,15 +538,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			const requestConversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
 			conversationId = requestConversationId;
+			const requestStateOwner = {};
+			conversationStateOwner = requestStateOwner;
 			const blobStore = conversationBlobStores.get(requestConversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(requestConversationId, blobStore);
-			const cachedState = conversationStateCache.get(requestConversationId);
+			const cachedState = conversationStateCache.get(requestConversationId)?.state;
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
 				conversationId: requestConversationId,
 				blobStore,
 				conversationState: cachedState,
 			});
-			conversationStateCache.set(requestConversationId, conversationState);
+			conversationStateCache.set(requestConversationId, { state: conversationState, owner: requestStateOwner });
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
@@ -626,7 +634,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			openBlockState = state;
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				conversationStateCache.set(requestConversationId, checkpoint);
+				if (conversationStateCache.get(requestConversationId)?.owner === requestStateOwner) {
+					conversationStateCache.set(requestConversationId, { state: checkpoint, owner: requestStateOwner });
+				}
 			};
 
 			h2Request.on("response", headers => {
@@ -807,7 +817,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
-			if (conversationId && !completedCleanly) {
+			if (
+				conversationId &&
+				conversationStateOwner &&
+				!completedCleanly &&
+				conversationStateCache.get(conversationId)?.owner === conversationStateOwner
+			) {
 				conversationStateCache.delete(conversationId);
 				log("conversationState", "invalidatedAfterInterruptedStream", { conversationId });
 			}
@@ -898,6 +913,35 @@ function buildResolvedCursorToolResults(messages: Message[], provider: string): 
 type CursorExecResolution = CursorExecPairing & {
 	previousResult?: ToolResultMessage;
 };
+
+interface CursorNativeExecReplay {
+	toolName: string;
+	result: unknown;
+}
+
+const kCursorNativeExecReplay = Symbol("cursorNativeExecReplay");
+
+type CursorReplayableToolResult = ToolResultMessage & {
+	[kCursorNativeExecReplay]?: CursorNativeExecReplay;
+};
+
+function nativeExecReplay(result: ToolResultMessage): CursorNativeExecReplay | undefined {
+	return (result as CursorReplayableToolResult)[kCursorNativeExecReplay];
+}
+
+function preserveNativeExecReplay(
+	toolResult: ToolResultMessage | undefined,
+	pairing: CursorExecPairing | null,
+	execResult: unknown,
+): void {
+	if (!toolResult || !pairing) return;
+	// Stale checkpoints and their automatic retries are process-local. Keep the
+	// exact proto result on the paired in-memory message without persisting a
+	// potentially large binary payload into the session JSON.
+	Object.defineProperty(toolResult, kCursorNativeExecReplay, {
+		value: { toolName: pairing.toolName, result: execResult } satisfies CursorNativeExecReplay,
+	});
+}
 
 function cursorExecResolution(state: BlockState, toolCallId: string, toolName: string): CursorExecResolution {
 	return {
@@ -2305,6 +2349,18 @@ export async function resolveExecHandler<TArgs, TResult>(
 			});
 			return { execResult: buildError(message) };
 		}
+		const nativeReplay = nativeExecReplay(pairing.previousResult);
+		if (nativeReplay) {
+			if (nativeReplay.toolName !== pairing.toolName) {
+				const message = `Cursor repeated tool call ${pairing.toolCallId} as ${pairing.toolName} after its native result completed as ${nativeReplay.toolName}`;
+				return { execResult: buildError(message) };
+			}
+			log("exec", "replayResolvedNativeResult", {
+				toolCallId: pairing.toolCallId,
+				toolName: pairing.toolName,
+			});
+			return { execResult: nativeReplay.result as TResult };
+		}
 		log("exec", "replayResolvedResult", { toolCallId: pairing.toolCallId, toolName: pairing.toolName });
 		return { execResult: buildFromToolResult(pairing.previousResult) };
 	}
@@ -2341,10 +2397,9 @@ export async function resolveExecHandler<TArgs, TResult>(
 			// two views consistent: every exec result is a proto oneof whose only
 			// non-failure variant is `success`, so a `rejected`/`error`/
 			// `file_not_found`/... result must not be recorded as a successful call.
-			return {
-				execResult,
-				toolResult: finalToolResult ?? (await pair(...describeExecResult(execResult))),
-			};
+			const pairedResult = finalToolResult ?? (await pair(...describeExecResult(execResult)));
+			preserveNativeExecReplay(pairedResult, pairing, execResult);
+			return { execResult, toolResult: pairedResult };
 		}
 		if (finalToolResult) {
 			return { execResult: buildFromToolResult(finalToolResult), toolResult: finalToolResult };

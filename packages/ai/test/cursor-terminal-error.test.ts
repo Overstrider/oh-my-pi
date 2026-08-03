@@ -37,6 +37,13 @@ type Scenario =
 	| { kind: "exec-then-hang" }
 	| { kind: "exec-and-turn" }
 	| { kind: "stale-checkpoint-retry"; requests: number }
+	| {
+			kind: "checkpoint-ownership-race";
+			requests: number;
+			firstStarted: PromiseWithResolvers<void>;
+			releaseFirst: PromiseWithResolvers<void>;
+			rootPromptMessagesJson?: Uint8Array[];
+	  }
 	| { kind: "todo-start-then-death" };
 
 let server: http2.Http2Server | undefined;
@@ -118,12 +125,16 @@ function execAndTurnEndedFrame(): Buffer {
 	return Buffer.concat([execRequestFrame(), turnEndedFrame()]);
 }
 
-function staleCheckpointFrame(): Buffer {
+function checkpointFrame(
+	pendingToolCalls = [JSON.stringify({ toolCallId: "call-final", toolName: "read" })],
+	rootPromptMessagesJson: Uint8Array[] = [],
+): Buffer {
 	const message = create(AgentServerMessageSchema, {
 		message: {
 			case: "conversationCheckpointUpdate",
 			value: create(ConversationStateStructureSchema, {
-				pendingToolCalls: [JSON.stringify({ toolCallId: "call-final", toolName: "read" })],
+				pendingToolCalls,
+				rootPromptMessagesJson,
 			}),
 		},
 	});
@@ -256,11 +267,32 @@ async function startServer(): Promise<string> {
 		if (scenario.kind === "stale-checkpoint-retry") {
 			scenario.requests++;
 			if (scenario.requests === 1) {
-				stream.write(Buffer.concat([staleCheckpointFrame(), execRequestFrame()]));
+				stream.write(Buffer.concat([checkpointFrame(), execRequestFrame()]));
 				stream.end();
 				return;
 			}
 			stream.write(execAndTurnEndedFrame());
+			stream.end();
+			return;
+		}
+
+		if (scenario.kind === "checkpoint-ownership-race") {
+			scenario.requests++;
+			if (scenario.requests === 1) {
+				const { firstStarted, releaseFirst } = scenario;
+				firstStarted.resolve();
+				void releaseFirst.promise.then(() => stream.end());
+				return;
+			}
+			if (scenario.requests === 2) {
+				stream.write(
+					checkpointFrame(
+						[JSON.stringify({ toolCallId: "newer-call", toolName: "read" })],
+						scenario.rootPromptMessagesJson,
+					),
+				);
+			}
+			stream.write(Buffer.concat([textDeltaFrame("newer"), turnEndedFrame()]));
 			stream.end();
 			return;
 		}
@@ -675,6 +707,57 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		expect(executions).toBe(1);
 		expect(replayedResults).toEqual([]);
 		expect(recovered.content.some(block => block.type === "toolCall" && block.id === "call-final")).toBe(false);
+	});
+
+	it("does not let an older failed request delete a newer checkpoint", async () => {
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		scenario = { kind: "checkpoint-ownership-race", requests: 0, firstStarted, releaseFirst };
+		const baseUrl = await startServer();
+		const model = makeModel(baseUrl);
+		const conversationId = "cursor-checkpoint-ownership";
+
+		const first = streamCursor(model, context, { apiKey: "test-token", conversationId });
+		const firstDone = (async () => {
+			for await (const _event of first) {
+				// Drain after the fixture releases this older request.
+			}
+			return await first.result();
+		})();
+		await firstStarted.promise;
+
+		const second = streamCursor(model, context, {
+			apiKey: "test-token",
+			conversationId,
+			onPayload: payload => {
+				const request = payload as { conversationState?: { rootPromptMessagesJson?: Uint8Array[] } };
+				if (scenario.kind === "checkpoint-ownership-race") {
+					scenario.rootPromptMessagesJson = request.conversationState?.rootPromptMessagesJson;
+				}
+			},
+		});
+		for await (const _event of second) {
+			// The newer request writes and owns its checkpoint.
+		}
+		expect((await second.result()).stopReason).toBe("stop");
+
+		releaseFirst.resolve();
+		expect((await firstDone).stopReason).toBe("error");
+
+		let thirdPendingCalls: string[] | undefined;
+		const third = streamCursor(model, context, {
+			apiKey: "test-token",
+			conversationId,
+			onPayload: payload => {
+				const request = payload as { conversationState?: { pendingToolCalls?: string[] } };
+				thirdPendingCalls = request.conversationState?.pendingToolCalls;
+			},
+		});
+		for await (const _event of third) {
+			// Drain the verification request.
+		}
+		expect((await third.result()).stopReason).toBe("stop");
+		expect(thirdPendingCalls).toEqual([JSON.stringify({ toolCallId: "newer-call", toolName: "read" })]);
 	});
 
 	it("executes a repeated call when the prior result says the tool never ran", async () => {

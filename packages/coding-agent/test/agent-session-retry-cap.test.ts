@@ -1669,7 +1669,7 @@ describe("AgentSession retry delay cap", () => {
 		expect(session.isRetrying).toBe(false);
 	});
 
-	it("caps Cursor transport recovery at two retries", async () => {
+	it("does not cap ordinary Cursor usage-limit retries", async () => {
 		const model = createMockModel({ id: "composer-2.5", provider: "cursor" });
 		authStorage.setRuntimeApiKey("cursor", "cursor-test-key");
 		const mock = createMockModel({
@@ -1678,19 +1678,19 @@ describe("AgentSession retry delay cap", () => {
 				{
 					content: [{ type: "thinking", thinking: "attempt 1" }],
 					stopReason: "error",
-					errorMessage: "502 Bad Gateway",
+					errorMessage: "429 Too Many Requests",
 				},
 				{
 					content: [{ type: "thinking", thinking: "attempt 2" }],
 					stopReason: "error",
-					errorMessage: "502 Bad Gateway",
+					errorMessage: "429 Too Many Requests",
 				},
 				{
 					content: [{ type: "thinking", thinking: "attempt 3" }],
 					stopReason: "error",
-					errorMessage: "502 Bad Gateway",
+					errorMessage: "429 Too Many Requests",
 				},
-				{ content: ["must remain unused"] },
+				{ content: ["recovered after Cursor usage limit"] },
 			],
 		});
 		const agent = new Agent({
@@ -1717,13 +1717,111 @@ describe("AgentSession retry delay cap", () => {
 			if (event.type === "auto_retry_start") retryStartEvents.push(event);
 		});
 
-		await session.prompt("Trigger repeated Cursor transport failures");
+		await session.prompt("Trigger repeated Cursor usage limits");
 		await session.waitForIdle();
 
-		expect(mock.calls).toHaveLength(3);
+		expect(mock.calls).toHaveLength(4);
+		expect(retryStartEvents).toHaveLength(3);
+		expect(retryStartEvents.at(-1)).toMatchObject({ attempt: 3, maxAttempts: 10 });
+		expect(lastAssistant(session).content).toContainEqual({
+			type: "text",
+			text: "recovered after Cursor usage limit",
+		});
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("caps resolved Cursor transport continuation at two retries", async () => {
+		const model = createMockModel({ id: "composer-2.5", provider: "cursor" });
+		authStorage.setRuntimeApiKey("cursor", "cursor-test-key");
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (_requestedModel, _context, options) => {
+				streamCalls++;
+				const callId = `cursor-read-${streamCalls}`;
+				const toolCall = {
+					type: "toolCall" as const,
+					id: callId,
+					name: "read",
+					arguments: { path: "/workspace/file.txt" },
+					[kCursorExecResolved]: true as const,
+				};
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(async () => {
+					await options?.cursorOnToolResult?.({
+						role: "toolResult",
+						toolCallId: callId,
+						toolName: "read",
+						content: [{ type: "text", text: "file body" }],
+						isError: false,
+						timestamp: Date.now(),
+					});
+					const partial: AssistantMessage = {
+						role: "assistant",
+						content: [toolCall],
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+						timestamp: Date.now(),
+					};
+					stream.push({ type: "start", partial });
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+					stream.push({
+						type: "toolcall_delta",
+						contentIndex: 0,
+						delta: JSON.stringify(toolCall.arguments),
+						partial,
+					});
+					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: {
+							...partial,
+							stopReason: "error",
+							errorMessage: "Cursor stream ended before turnEnded",
+							errorId: AIError.create(AIError.Flag.Transient),
+						},
+					});
+				});
+				return stream;
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 10,
+			"retry.modelFallback": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+		});
+
+		await session.prompt("Trigger repeated resolved Cursor transport failures");
+		await session.waitForIdle();
+
+		expect(streamCalls).toBe(3);
 		expect(retryStartEvents).toHaveLength(2);
 		expect(retryStartEvents.at(-1)).toMatchObject({ attempt: 2, maxAttempts: 2 });
-		expect(lastAssistant(session).errorMessage).toBe("502 Bad Gateway");
 		expect(session.isRetrying).toBe(false);
 	});
 
