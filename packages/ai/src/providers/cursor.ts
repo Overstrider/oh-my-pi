@@ -1345,6 +1345,10 @@ function sendShellStreamExitFromResult(
 	}
 }
 
+function stableCursorExecToolCallId(execMsg: ExecServerMessage): string {
+	return `cursor-exec:${execMsg.execId}:${execMsg.id}:${execMsg.message.case || "unknown"}`;
+}
+
 async function handleExecServerMessage(
 	execMsg: ExecServerMessage,
 	h2Request: http2.ClientHttp2Stream,
@@ -1396,7 +1400,7 @@ async function handleExecServerMessage(
 	switch (execCase) {
 		case "readArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			// The same composed selector the bridge executes: showing a bare path
 			// for a ranged read makes the returned slice look like the whole
 			// file in every rebuilt transcript.
@@ -1422,7 +1426,7 @@ async function handleExecServerMessage(
 		}
 		case "lsArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			// Bridge maps `ls` onto the coding-agent `read` tool (see
 			// `CursorExecHandlers.ls` in `pi-coding-agent/src/cursor.ts`); mirror
 			// that here so the synthesized block matches the toolResult's `toolName`.
@@ -1441,7 +1445,7 @@ async function handleExecServerMessage(
 		}
 		case "grepArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			// Cursor's model sometimes emits `grepArgs` with an empty `pattern` and a
 			// non-empty `glob`, expecting grep to list files matching the glob. Reject
 			// that up front with an actionable error so the model retries with a real
@@ -1477,7 +1481,7 @@ async function handleExecServerMessage(
 		}
 		case "writeArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			// Match the bridge: prefer `fileText`, fall back to decoded `fileBytes`.
 			const content = args.fileText ?? new TextDecoder().decode(args.fileBytes ?? new Uint8Array());
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "write", {
@@ -1507,7 +1511,7 @@ async function handleExecServerMessage(
 		}
 		case "deleteArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "delete", { path: args.path });
 			const { execResult } = await resolveExecHandler(
 				args,
@@ -1523,7 +1527,7 @@ async function handleExecServerMessage(
 		}
 		case "shellArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			const normalizedArgs: ShellArgs = { ...args, workingDirectory: args.workingDirectory || process.cwd() };
 			// Match the bridge (`CursorExecHandlers.shell`): map `workingDirectory`
 			// → `cwd`, drop non-positive timeouts.
@@ -1548,7 +1552,7 @@ async function handleExecServerMessage(
 		}
 		case "shellStreamArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			const shellStreamTimeout = args.timeout && args.timeout > 0 ? args.timeout : undefined;
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "bash", {
 				command: args.command,
@@ -1602,7 +1606,7 @@ async function handleExecServerMessage(
 		}
 		case "diagnosticsArgs": {
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			// Bridge maps `diagnostics` onto the coding-agent `lsp` tool with
 			// `action: "diagnostics"` and `file: path`.
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "lsp", {
@@ -1694,7 +1698,7 @@ async function handleExecServerMessage(
 			// result or the listing is invisible in the UI and gone from every
 			// rebuilt history. Only synthesized when a handler exists: without
 			// one the frame is a fixed empty answer that executed nothing.
-			const toolCallId = execHandlers?.listMcpResources ? crypto.randomUUID() : undefined;
+			const toolCallId = execHandlers?.listMcpResources ? stableCursorExecToolCallId(execMsg) : undefined;
 			if (toolCallId) {
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "list_mcp_resources", {
 					server: args.server,
@@ -1758,7 +1762,7 @@ async function handleExecServerMessage(
 			// and absent from every rebuilt history. Only synthesized when a
 			// handler exists: without one the frame is a fixed `not_found` that
 			// executed nothing, and a block would claim work that never happened.
-			const toolCallId = execHandlers?.readMcpResource ? crypto.randomUUID() : undefined;
+			const toolCallId = execHandlers?.readMcpResource ? stableCursorExecToolCallId(execMsg) : undefined;
 			if (toolCallId) {
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read_mcp_resource", {
 					server: args.server,
@@ -1867,7 +1871,7 @@ async function handleExecServerMessage(
 		}
 		case "piReadArgs": {
 			const args = execMsg.message.value;
-			const toolCallId = crypto.randomUUID();
+			const toolCallId = stableCursorExecToolCallId(execMsg);
 			// The displayed block must show the operation that actually runs: the
 			// bridge composes the same range selector onto the path.
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read", {
@@ -1887,7 +1891,7 @@ async function handleExecServerMessage(
 		}
 		case "piBashArgs": {
 			const args = execMsg.message.value;
-			const toolCallId = crypto.randomUUID();
+			const toolCallId = stableCursorExecToolCallId(execMsg);
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "bash", {
 				command: args.command,
 				timeout: piTimeout(args.timeout),
@@ -1906,7 +1910,7 @@ async function handleExecServerMessage(
 		}
 		case "piEditArgs": {
 			const args = execMsg.message.value;
-			const toolCallId = crypto.randomUUID();
+			const toolCallId = stableCursorExecToolCallId(execMsg);
 			// `PiEditReplacement` is the local `edit` tool's replace mode verbatim:
 			// snake_case `old_text`/`new_text` entries against one path.
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "edit", {
@@ -1927,7 +1931,7 @@ async function handleExecServerMessage(
 		}
 		case "piWriteArgs": {
 			const args = execMsg.message.value;
-			const toolCallId = crypto.randomUUID();
+			const toolCallId = stableCursorExecToolCallId(execMsg);
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "write", {
 				path: args.path,
 				content: args.content,
@@ -1946,7 +1950,7 @@ async function handleExecServerMessage(
 		}
 		case "piGrepArgs": {
 			const args = execMsg.message.value;
-			const toolCallId = crypto.randomUUID();
+			const toolCallId = stableCursorExecToolCallId(execMsg);
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "grep", {
 				pattern: args.literal === true ? piEscapeRegexLiteral(args.pattern) : args.pattern,
 				path: args.glob ? piJoinPath(args.path, args.glob) : args.path || ".",
@@ -1973,7 +1977,7 @@ async function handleExecServerMessage(
 		}
 		case "piFindArgs": {
 			const args = execMsg.message.value;
-			const toolCallId = crypto.randomUUID();
+			const toolCallId = stableCursorExecToolCallId(execMsg);
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "glob", {
 				path: piJoinPath(args.path, args.pattern),
 				limit: piLimit(args.limit),
@@ -1992,7 +1996,7 @@ async function handleExecServerMessage(
 		}
 		case "piLsArgs": {
 			const args = execMsg.message.value;
-			const toolCallId = crypto.randomUUID();
+			const toolCallId = stableCursorExecToolCallId(execMsg);
 			// Same mapping as the legacy `lsArgs` frame: the local `read` tool lists
 			// directories, so the synthesized block must name `read` to match the
 			// bridge's own `toolResult`.
@@ -2013,7 +2017,7 @@ async function handleExecServerMessage(
 			// Same `ShellArgs`/`ShellResult` pair as `shellArgs`, under its own frame
 			// number, so the existing shell handler answers it unchanged.
 			const args = execMsg.message.value;
-			if (!args.toolCallId) args.toolCallId = crypto.randomUUID();
+			if (!args.toolCallId) args.toolCallId = stableCursorExecToolCallId(execMsg);
 			const normalizedArgs: ShellArgs = { ...args, workingDirectory: args.workingDirectory || process.cwd() };
 			synthesizeCursorExecToolCall(output, stream, state, args.toolCallId, "bash", {
 				command: args.command,
@@ -2182,7 +2186,7 @@ async function handleExecServerMessage(
 			// interaction on replay. The frame carries its own `tool_call_id`, so
 			// the streamed announcement and this block agree on the key.
 			const args = execMsg.message.value;
-			const toolCallId = args.toolCallId || crypto.randomUUID();
+			const toolCallId = args.toolCallId || stableCursorExecToolCallId(execMsg);
 			const error = `Conversation search is ${NOT_IMPLEMENTED_SUFFIX}`;
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "search_conversations", {
 				query: args.query,

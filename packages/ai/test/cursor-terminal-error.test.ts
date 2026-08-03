@@ -5,6 +5,7 @@ import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
 import type {
 	AssistantMessage,
 	Context,
+	CursorExecHandlers,
 	CursorToolResultHandler,
 	Model,
 	ToolResultMessage,
@@ -15,6 +16,10 @@ import {
 	ConversationStateStructureSchema,
 	ExecServerMessageSchema,
 	InteractionUpdateSchema,
+	PiBashExecArgsSchema,
+	PiEditExecArgsSchema,
+	PiEditReplacementSchema,
+	PiWriteExecArgsSchema,
 	ReadArgsSchema,
 	TextDeltaUpdateSchema,
 	ToolCallSchema,
@@ -37,6 +42,7 @@ type Scenario =
 	| { kind: "exec-then-hang" }
 	| { kind: "exec-and-turn" }
 	| { kind: "stale-checkpoint-retry"; requests: number }
+	| { kind: "pi-exec-retry"; requests: number; piExec: "write" | "bash" | "edit" }
 	| {
 			kind: "checkpoint-ownership-race";
 			requests: number;
@@ -110,6 +116,38 @@ function execRequestFrame(): Buffer {
 					case: "readArgs",
 					value: create(ReadArgsSchema, { path: "/tmp/final", toolCallId: "call-final" }),
 				},
+			}),
+		},
+	});
+	return frameConnectMessage(toBinary(AgentServerMessageSchema, message));
+}
+
+function piExecRequestFrame(kind: "write" | "bash" | "edit"): Buffer {
+	const execMessage =
+		kind === "write"
+			? {
+					case: "piWriteArgs" as const,
+					value: create(PiWriteExecArgsSchema, { path: "/tmp/replay.txt", content: "once" }),
+				}
+			: kind === "bash"
+				? {
+						case: "piBashArgs" as const,
+						value: create(PiBashExecArgsSchema, { command: "echo once" }),
+					}
+				: {
+						case: "piEditArgs" as const,
+						value: create(PiEditExecArgsSchema, {
+							path: "/tmp/replay.txt",
+							edits: [create(PiEditReplacementSchema, { oldText: "before", newText: "after" })],
+						}),
+					};
+	const message = create(AgentServerMessageSchema, {
+		message: {
+			case: "execServerMessage",
+			value: create(ExecServerMessageSchema, {
+				id: 73,
+				execId: `stable-pi-${kind}`,
+				message: execMessage,
 			}),
 		},
 	});
@@ -272,6 +310,14 @@ async function startServer(): Promise<string> {
 				return;
 			}
 			stream.write(execAndTurnEndedFrame());
+			stream.end();
+			return;
+		}
+
+		if (scenario.kind === "pi-exec-retry") {
+			scenario.requests++;
+			stream.write(piExecRequestFrame(scenario.piExec));
+			if (scenario.requests > 1) stream.write(turnEndedFrame());
 			stream.end();
 			return;
 		}
@@ -759,6 +805,78 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		expect((await third.result()).stopReason).toBe("stop");
 		expect(thirdPendingCalls).toEqual([JSON.stringify({ toolCallId: "newer-call", toolName: "read" })]);
 	});
+
+	it.each(["write", "bash", "edit"] as const)(
+		"reuses a stable ID when an interrupted stream repeats an ID-less Pi %s",
+		async piExec => {
+			scenario = { kind: "pi-exec-retry", requests: 0, piExec };
+			const baseUrl = await startServer();
+			const model = makeModel(baseUrl);
+			const paired: ToolResultMessage[] = [];
+			let executions = 0;
+			const result = (toolCallId: string, toolName: "write" | "bash" | "edit"): ToolResultMessage => ({
+				role: "toolResult",
+				toolCallId,
+				toolName,
+				content: [{ type: "text", text: "executed once" }],
+				isError: false,
+				timestamp: 1,
+			});
+			const execHandlers: CursorExecHandlers = {};
+			if (piExec === "write") {
+				execHandlers.piWrite = async ({ toolCallId }) => {
+					executions++;
+					return result(toolCallId, "write");
+				};
+			} else if (piExec === "bash") {
+				execHandlers.piBash = async ({ toolCallId }) => {
+					executions++;
+					return result(toolCallId, "bash");
+				};
+			} else {
+				execHandlers.piEdit = async ({ toolCallId }) => {
+					executions++;
+					return result(toolCallId, "edit");
+				};
+			}
+
+			const first = streamCursor(model, context, {
+				apiKey: "test-token",
+				execHandlers,
+				onToolResult: result => {
+					paired.push(result);
+					return result;
+				},
+			});
+			for await (const _event of first) {
+				// Drain the interrupted execution.
+			}
+			const interrupted = await first.result();
+			expect(interrupted.stopReason).toBe("error");
+			expect(executions).toBe(1);
+			expect(paired).toHaveLength(1);
+
+			const replayedResults: ToolResultMessage[] = [];
+			const retry = streamCursor(
+				model,
+				{ messages: [...context.messages, interrupted, paired[0]] },
+				{
+					apiKey: "test-token",
+					execHandlers,
+					onToolResult: result => {
+						replayedResults.push(result);
+						return result;
+					},
+				},
+			);
+			for await (const _event of retry) {
+				// Drain the successful replay.
+			}
+			expect((await retry.result()).stopReason).toBe("stop");
+			expect(executions).toBe(1);
+			expect(replayedResults).toEqual([]);
+		},
+	);
 
 	it("executes a repeated call when the prior result says the tool never ran", async () => {
 		scenario = { kind: "exec-and-turn" };
