@@ -169,6 +169,10 @@ export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
+	// Cached replay attempts may omit the already-resolved tool block, so keep the
+	// safety cap on saga state instead of trying to reclassify every failed turn.
+	#cursorInterruptedExecRetrySaga = false;
+	#cursorInterruptedExecRetryAttempt = 0;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
@@ -246,14 +250,14 @@ export class TurnRecovery {
 			recoveredErrors,
 		});
 		this.#clearPendingRecoveredRetryErrors();
-		this.#retryAttempt = 0;
+		this.#resetRetrySaga();
 	}
 
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetrySaga();
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_end",
 			success: false,
@@ -366,6 +370,12 @@ export class TurnRecovery {
 
 	#clearPendingRecoveredRetryErrors(): void {
 		this.#pendingRecoveredRetryErrors = [];
+	}
+
+	#resetRetrySaga(): void {
+		this.#retryAttempt = 0;
+		this.#cursorInterruptedExecRetrySaga = false;
+		this.#cursorInterruptedExecRetryAttempt = 0;
 	}
 
 	/**
@@ -531,7 +541,7 @@ export class TurnRecovery {
 				finalError,
 			});
 			this.#clearPendingRecoveredRetryErrors();
-			this.#retryAttempt = 0;
+			this.#resetRetrySaga();
 			this.resolveRetry();
 			// A zero-content turn carries no transcript value, while its provider usage
 			// can anchor the next prompt at the full failed-request size and re-trigger
@@ -899,7 +909,7 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Classify a reasonless abort or stream stall whose emitted tool calls all
+	 * Classify a reasonless abort or transient Cursor stream failure whose emitted tool calls all
 	 * have results. The failed assistant/tool-result pair stays in context so
 	 * continuation cannot replay completed side effects; synthetic results tell
 	 * the next turn that an unexecuted call must be reissued.
@@ -918,11 +928,17 @@ export class TurnRecovery {
 			message.stopReason === "error" &&
 			message.errorMessage?.toLowerCase().includes("stream stall") === true &&
 			AIError.retriable(id);
-		if (!reasonlessAbort && !streamStall) return undefined;
+		const cursorTransientStreamFailure =
+			message.stopReason === "error" &&
+			message.provider === "cursor" &&
+			AIError.is(id, AIError.Flag.Transient) &&
+			!AIError.is(id, AIError.Flag.UsageLimit);
+		const interruptedStream = streamStall || cursorTransientStreamFailure;
+		if (!reasonlessAbort && !interruptedStream) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);
 
-		// The Cursor server-execution marker gate applies only to the stream-stall
-		// path: an unmarked/unresolved Cursor block there means the server has not
+		// The Cursor server-execution marker gate applies only to transient stream
+		// failures: an unmarked/unresolved Cursor block there means the server has not
 		// finished executing, so resuming would race it. A reasonless abort instead
 		// ends the turn and the agent loop pairs every un-run call (Cursor's unmarked
 		// `todo`/MCP blocks included) with a synthetic `executed: false` result, so
@@ -932,7 +948,7 @@ export class TurnRecovery {
 		for (const block of message.content) {
 			if (block.type !== "toolCall") continue;
 			if (
-				streamStall &&
+				interruptedStream &&
 				message.provider === "cursor" &&
 				(!(kCursorExecResolved in block) || block[kCursorExecResolved] !== true)
 			) {
@@ -1125,13 +1141,17 @@ export class TurnRecovery {
 		});
 	}
 
-	async #tryRetryModelFallback(currentSelector: string, options?: { pinFallback?: boolean }): Promise<boolean> {
+	async #tryRetryModelFallback(
+		currentSelector: string,
+		options?: { pinFallback?: boolean; allowCursorCandidates?: boolean },
+	): Promise<boolean> {
 		const role = this.#activeRetryFallback?.role ?? this.resolveRetryFallbackRole(currentSelector);
 		if (!role) return false;
 
 		const ceiling = this.#host.thinkingLevelCeiling();
 		for (const selector of this.findRetryFallbackCandidates(role, currentSelector)) {
 			if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
+			if (options?.allowCursorCandidates === false && selector.provider === "cursor") continue;
 			const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 			const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 			if (!candidate) continue;
@@ -1354,9 +1374,19 @@ export class TurnRecovery {
 		// the model once and lets the base turn proceed.
 		if (!retrySettings.enabled && !options?.fireworksFastFallback) return false;
 		const classifierRefusal = this.isClassifierRefusal(message);
+		if (message.provider === "cursor" && options?.preserveFailedTurn) {
+			this.#cursorInterruptedExecRetrySaga = true;
+		}
+		// Model changes can happen through UI/RPC/extensions while a retry sleeps,
+		// so provider activity must be derived from the failing request rather than
+		// retained from whichever path last changed the model.
+		const cursorInterruptedExecRetryActive = this.#cursorInterruptedExecRetrySaga && message.provider === "cursor";
 
 		const generation = this.#host.promptGeneration();
 		this.#retryAttempt++;
+		if (this.#cursorInterruptedExecRetrySaga && message.provider === "cursor") {
+			this.#cursorInterruptedExecRetryAttempt++;
+		}
 
 		// Create retry promise on first attempt so waitForRetry() can await it
 		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
@@ -1372,10 +1402,18 @@ export class TurnRecovery {
 		// (every rotation sets switchedCredential and skips it), so without
 		// this last resort a provider-wide usage cap never fails over to the
 		// configured chain.
+		const cursorMaxRetries = Math.min(retrySettings.maxRetries, 2);
 		const maxRetries = this.#isOpenRouterThinkingStreamClose(message)
 			? Math.min(retrySettings.maxRetries, 1)
-			: retrySettings.maxRetries;
-		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
+			: cursorInterruptedExecRetryActive
+				? cursorMaxRetries
+				: retrySettings.maxRetries;
+		const budgetAttempt = cursorInterruptedExecRetryActive
+			? this.#cursorInterruptedExecRetryAttempt
+			: this.#retryAttempt;
+		const retryBudgetExhausted = budgetAttempt > maxRetries;
+		const cursorRetryBudgetExhausted =
+			this.#cursorInterruptedExecRetrySaga && this.#cursorInterruptedExecRetryAttempt > cursorMaxRetries;
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -1441,7 +1479,15 @@ export class TurnRecovery {
 				if (!classifierRefusal) {
 					this.noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
 				}
-				switchedModel = await this.#tryRetryModelFallback(currentSelector, { pinFallback: classifierRefusal });
+				switchedModel = await this.#tryRetryModelFallback(currentSelector, {
+					pinFallback: classifierRefusal,
+					// Cursor's interrupted-exec watchdog is a saga-wide safety cap.
+					// Once spent, another Cursor candidate must not reset it and
+					// continue an arbitrarily long Cursor-only fallback chain. A
+					// later non-Cursor candidate is still safe: switching provider
+					// clears the special latch below and restores the normal budget.
+					allowCursorCandidates: !cursorRetryBudgetExhausted,
+				});
 			}
 			// Auto fallback from a Fireworks Fast variant to its base model. Independent
 			// of the role-fallback setting: it's intrinsic to the Fast contract (speed
@@ -1469,7 +1515,7 @@ export class TurnRecovery {
 					finalError: message.errorMessage,
 				});
 				this.#clearPendingRecoveredRetryErrors();
-				this.#retryAttempt = 0;
+				this.#resetRetrySaga();
 				this.resolveRetry(); // Resolve so waitForRetry() completes
 				return false;
 			}
@@ -1495,7 +1541,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRecoveredRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetrySaga();
 			this.resolveRetry();
 			return false;
 		}
@@ -1520,7 +1566,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRecoveredRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetrySaga();
 			this.resolveRetry();
 			return false;
 		}
@@ -1536,7 +1582,7 @@ export class TurnRecovery {
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetrySaga();
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
@@ -1582,7 +1628,7 @@ export class TurnRecovery {
 			}
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetrySaga();
 			this.#retryAbortController = undefined;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
@@ -1654,7 +1700,7 @@ export class TurnRecovery {
 	async #failRetryAfterLocalContinueError(message: AssistantMessage, error: unknown): Promise<void> {
 		if (this.#retryAttempt === 0) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetrySaga();
 		const localError = error instanceof Error ? error.message : String(error);
 		await this.persistTerminalEmptyErrorTurn(message);
 		await this.#host.emitSessionEvent({
@@ -1777,7 +1823,7 @@ export class TurnRecovery {
 		}
 
 		// Reset retry budget for a fresh attempt
-		this.#retryAttempt = 0;
+		this.#resetRetrySaga();
 
 		// Re-attempt the turn
 		this.#host.scheduleAgentContinue({ delayMs: 1 });
