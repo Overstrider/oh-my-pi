@@ -940,6 +940,7 @@ function preserveNativeExecReplay(
 	// potentially large binary payload into the session JSON.
 	Object.defineProperty(toolResult, kCursorNativeExecReplay, {
 		value: { toolName: pairing.toolName, result: execResult } satisfies CursorNativeExecReplay,
+		enumerable: true,
 	});
 }
 

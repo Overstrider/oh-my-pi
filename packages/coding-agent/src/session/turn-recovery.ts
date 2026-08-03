@@ -919,7 +919,10 @@ export class TurnRecovery {
 			message.errorMessage?.toLowerCase().includes("stream stall") === true &&
 			AIError.retriable(id);
 		const cursorTransientStreamFailure =
-			message.stopReason === "error" && message.provider === "cursor" && AIError.retriable(id);
+			message.stopReason === "error" &&
+			message.provider === "cursor" &&
+			AIError.is(id, AIError.Flag.Transient) &&
+			!AIError.is(id, AIError.Flag.UsageLimit);
 		const interruptedStream = streamStall || cursorTransientStreamFailure;
 		if (!reasonlessAbort && !interruptedStream) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);
