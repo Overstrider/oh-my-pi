@@ -4,6 +4,7 @@ import {
 	type BlockState,
 	buildCursorHistoryForTest,
 	buildCursorSystemPromptJsons,
+	buildResolvedCursorToolResults,
 	emptyGrepPatternRejection,
 	handleServerMessage,
 	processInteractionUpdate,
@@ -224,6 +225,32 @@ describe("Cursor resolveExecHandler execHandlers binding", () => {
 				content: [{ type: "text", text: "Tool not available" }],
 				isError: true,
 			});
+		});
+
+		it("replays the exact rejected result when no handler was installed", async () => {
+			const first = await resolveExecHandler<{ path: string }, { tag: string; reason?: string; message?: string }>(
+				{ path: "/tmp/foo" },
+				undefined,
+				undefined,
+				() => ({ tag: "generic-error" }),
+				(reason: string) => ({ tag: "rejected", reason }),
+				(message: string) => ({ tag: "error", message }),
+				pairing,
+			);
+			if (!first.toolResult) throw new Error("expected a paired rejection");
+
+			const replay = await resolveExecHandler<{ path: string }, { tag: string; reason?: string; message?: string }>(
+				{ path: "/tmp/foo" },
+				undefined,
+				undefined,
+				() => ({ tag: "generic-error" }),
+				(reason: string) => ({ tag: "rejected", reason }),
+				(message: string) => ({ tag: "error", message }),
+				{ ...pairing, previousResult: first.toolResult },
+			);
+
+			expect(replay.execResult).toBe(first.execResult);
+			expect(replay.execResult).toEqual({ tag: "rejected", reason: "Tool not available" });
 		});
 
 		it("pairs when the handler produces nothing", async () => {
@@ -600,6 +627,32 @@ describe("Cursor request action encoding", () => {
 });
 
 describe("Cursor history encoding", () => {
+	it("limits fallback-ID replay candidates to a trailing interrupted tool turn", () => {
+		const callId = "cursor-exec::7:piBashArgs";
+		const assistant = cursorAssistant(
+			"cursor-composer-2.5",
+			[{ type: "toolCall", id: callId, name: "bash", arguments: { command: "echo first" } }],
+			2,
+			"toolUse",
+		);
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: callId,
+			toolName: "bash",
+			content: [{ type: "text", text: "first" }],
+			isError: false,
+			timestamp: 3,
+		};
+
+		expect(buildResolvedCursorToolResults([assistant, result], "cursor").get(callId)).toBe(result);
+		expect(
+			buildResolvedCursorToolResults(
+				[assistant, result, { role: "user", content: "Run a new command", timestamp: 4 }],
+				"cursor",
+			).size,
+		).toBe(0);
+	});
+
 	it("keeps an empty tool result paired with its structured call", () => {
 		const messages: Context["messages"] = [
 			{ role: "user", content: "Read the empty window.", timestamp: 1 },

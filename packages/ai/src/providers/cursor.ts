@@ -895,19 +895,30 @@ function isSafelyReplayableToolResult(result: ToolResultMessage): boolean {
 	return details.__synthetic !== true && details.__interrupted !== true && details.executed !== false;
 }
 
-function buildResolvedCursorToolResults(messages: Message[], provider: string): Map<string, ToolResultMessage> {
-	const cursorCalls = new Map<string, string>();
+export function buildResolvedCursorToolResults(messages: Message[], provider: string): Map<string, ToolResultMessage> {
 	const results = new Map<string, ToolResultMessage>();
-	for (const message of messages) {
-		if (message.role === "assistant" && message.api === "cursor-agent" && message.provider === provider) {
-			for (const block of message.content) {
-				if (block.type === "toolCall") cursorCalls.set(block.id, block.name);
-			}
-			continue;
-		}
-		if (message.role !== "toolResult" || !isSafelyReplayableToolResult(message)) continue;
-		const toolName = cursorCalls.get(message.toolCallId);
-		if (toolName === message.toolName) results.set(message.toolCallId, message);
+	// Automatic continuation keeps the interrupted assistant turn followed by
+	// its paired results at the tail. A new user/developer turn does not: never
+	// let fallback IDs from older turns suppress fresh exec frames that happen
+	// to reuse Cursor's optional numeric id.
+	let index = messages.length - 1;
+	if (messages[index]?.role !== "toolResult") return results;
+	const trailingResults: ToolResultMessage[] = [];
+	while (index >= 0 && messages[index]?.role === "toolResult") {
+		const result = messages[index] as ToolResultMessage;
+		if (isSafelyReplayableToolResult(result)) trailingResults.push(result);
+		index--;
+	}
+	const assistant = messages[index];
+	if (assistant?.role !== "assistant" || assistant.api !== "cursor-agent" || assistant.provider !== provider) {
+		return results;
+	}
+	const cursorCalls = new Map<string, string>();
+	for (const block of assistant.content) {
+		if (block.type === "toolCall") cursorCalls.set(block.id, block.name);
+	}
+	for (const result of trailingResults) {
+		if (cursorCalls.get(result.toolCallId) === result.toolName) results.set(result.toolCallId, result);
 	}
 	return results;
 }
@@ -2402,7 +2413,10 @@ export async function resolveExecHandler<TArgs, TResult>(
 
 	if (!handler) {
 		const reason = "Tool not available";
-		return { execResult: buildRejected(reason), toolResult: await pair(reason, true) };
+		const execResult = buildRejected(reason);
+		const toolResult = await pair(reason, true);
+		preserveNativeExecReplay(toolResult, pairing, execResult);
+		return { execResult, toolResult };
 	}
 
 	try {
@@ -2424,10 +2438,16 @@ export async function resolveExecHandler<TArgs, TResult>(
 			return { execResult: buildFromToolResult(finalToolResult), toolResult: finalToolResult };
 		}
 		const reason = "Tool returned no result";
-		return { execResult: buildRejected(reason), toolResult: await pair(reason, true) };
+		const rejectedResult = buildRejected(reason);
+		const pairedResult = await pair(reason, true);
+		preserveNativeExecReplay(pairedResult, pairing, rejectedResult);
+		return { execResult: rejectedResult, toolResult: pairedResult };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		return { execResult: buildError(message), toolResult: await pair(message, true) };
+		const execResult = buildError(message);
+		const pairedResult = await pair(message, true);
+		preserveNativeExecReplay(pairedResult, pairing, execResult);
+		return { execResult, toolResult: pairedResult };
 	}
 }
 
