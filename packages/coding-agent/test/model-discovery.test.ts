@@ -1328,6 +1328,11 @@ providers:
 		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: Number.NaN })).toBe(false);
 		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: "30000" as any })).toBe(false);
 	});
+	test("ProviderDiscoverySchema accepts the allowEmpty policy", () => {
+		expect(ProviderDiscoverySchema.allows({ type: "proxy", allowEmpty: false })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "proxy", allowEmpty: true })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "proxy", allowEmpty: "false" as any })).toBe(false);
+	});
 	test("llama.cpp discovery marks per-model architecture image modalities as vision-capable", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);

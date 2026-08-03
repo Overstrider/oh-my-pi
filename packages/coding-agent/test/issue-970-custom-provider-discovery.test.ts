@@ -138,6 +138,43 @@ describe("issue #970 custom provider discovery", () => {
 		expect(deepseek?.maxTokens).toBe(32_768);
 	});
 
+	test("keeps the last proxy catalog when allowEmpty is false", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  resilient-proxy:",
+				"    baseUrl: http://127.0.0.1:9996/v1",
+				"    api: openai-completions",
+				"    auth: none",
+				"    discovery:",
+				"      type: proxy",
+				"      allowEmpty: false",
+			].join("\n"),
+		);
+
+		let empty = false;
+		const registry = new ModelRegistryImpl(authStorage, modelsPath, {
+			fetch: async input => {
+				if (String(input) !== "http://127.0.0.1:9996/v1/models") {
+					throw new Error(`Unexpected URL: ${String(input)}`);
+				}
+				return Response.json({
+					data: empty ? [] : [{ id: "stable-model", supported_endpoint_types: ["openai"] }],
+				});
+			},
+		});
+
+		await registry.refreshProvider("resilient-proxy", "online");
+		expect(registry.find("resilient-proxy", "stable-model")).toBeDefined();
+
+		empty = true;
+		await registry.refreshProvider("resilient-proxy", "online");
+		expect(registry.find("resilient-proxy", "stable-model")).toBeDefined();
+		expect(registry.getProviderDiscoveryState("resilient-proxy")?.status).toBe("cached");
+		expect(registry.getProviderDiscoveryState("resilient-proxy")?.error).toContain("Empty model catalog");
+	});
+
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {
 		installTestTheme();
 		const hub = await createHub({

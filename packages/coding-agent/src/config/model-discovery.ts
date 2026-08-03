@@ -931,6 +931,9 @@ export async function discoverProxyModels(
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
 	const items = payload.data ?? [];
+	if (items.length === 0 && providerConfig.discovery.allowEmpty === false) {
+		throw new Error(`Empty model catalog from ${modelsUrl}`);
+	}
 	const discovered: Model<Api>[] = [];
 	for (const item of items) {
 		const id = item.id;
