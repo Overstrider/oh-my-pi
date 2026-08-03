@@ -2219,7 +2219,9 @@ async function handleExecServerMessage(
 				query: args.query,
 				limit: args.limit,
 			});
-			await pairSynthesizedExecResult(state, onToolResult, toolCallId, "search_conversations", error);
+			if (!state.resolvedContextToolResults?.has(toolCallId)) {
+				await pairSynthesizedExecResult(state, onToolResult, toolCallId, "search_conversations", error);
+			}
 			const execResult = create(ConversationSearchResultSchema, {
 				result: { case: "error", value: create(ConversationSearchErrorSchema, { error }) },
 			});

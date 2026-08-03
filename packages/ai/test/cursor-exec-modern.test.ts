@@ -1511,6 +1511,26 @@ describe("Cursor modern exec frames: server-resolved tool calls leave a paired b
 		expect(results[0].isError).toBe(true);
 	});
 
+	it("does not pair a cached ID-less conversationSearch result twice", async () => {
+		const message = buildExecMessage({
+			case: "conversationSearchArgs",
+			value: create(ConversationSearchArgsSchema, { query: "chess", limit: 5 }),
+		});
+		const first = await dispatchExec(message);
+		const block = first.output.content.find((item): item is ToolCallState => item.type === "toolCall");
+		if (!block || !first.results[0]) throw new Error("expected a paired conversation search result");
+
+		const replay = await dispatchExec(message, {
+			state: newBlockState({ resolvedContextToolResults: new Map([[block.id, first.results[0]]]) }),
+		});
+		const answer = soleResult(replay.frames);
+		if (answer.case !== "conversationSearchResult") throw new Error(`got ${answer.case}`);
+
+		expect(answer.value.result.case).toBe("error");
+		expect(replay.output.content).toHaveLength(0);
+		expect(replay.results).toHaveLength(0);
+	});
+
 	/**
 	 * Drive a streamed `connect_scm` pair through the interaction decoder.
 	 *
