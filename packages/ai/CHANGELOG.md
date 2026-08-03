@@ -12,6 +12,7 @@
 
 ### Fixed
 
+- Fixed Cursor `pi_grep` and `pi_find` bridge paths leaking Windows backslashes into protocol tool payloads, which broke glob expansion on Windows.
 - Fixed Kimi K3 requests through `merlin-9router/kimi/*` using the generic 64K OpenAI-compatible output clamp instead of the model's advertised output limit.
 - Fixed interrupted Cursor streams retaining stale `pendingToolCalls` checkpoints and re-executing already completed local tools on continuation. Failed streams now discard cached conversation state, and repeated resolved exec IDs reuse their canonical tool result without invoking the handler again ([#6772](https://github.com/can1357/oh-my-pi/issues/6772)).
 - Fixed Harmony control-token escaping skipping model-owned replay items. The issue-#6913 fix only escaped user/developer text and tool results, so a model that legitimately wrote about the Harmony format (e.g. `<|channel|>`, `<|call|>` in article or test content) sampled those spellings into its own `function_call.arguments`; the next full-transcript replay (stale or blocked `previous_response_id`, provider fallback) fed them back as input and gpt-5.x rejected every retry with `invalid_prompt` / "Request blocked", permanently poisoning the session. Replayed `function_call.arguments` (JSON-preserving escape), `custom_tool_call.input`, and assistant `output_text`/`refusal` blocks are now escaped on the wire copy for Harmony-dialect models, on both the shared Responses builder and the Codex builder.
