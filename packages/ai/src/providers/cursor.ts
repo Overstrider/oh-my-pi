@@ -913,6 +913,7 @@ export function buildResolvedCursorToolResults(messages: Message[], provider: st
 	if (assistant?.role !== "assistant" || assistant.api !== "cursor-agent" || assistant.provider !== provider) {
 		return results;
 	}
+	if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") return results;
 	const cursorCalls = new Map<string, string>();
 	for (const block of assistant.content) {
 		if (block.type === "toolCall") cursorCalls.set(block.id, block.name);

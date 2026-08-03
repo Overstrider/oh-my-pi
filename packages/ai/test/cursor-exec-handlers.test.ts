@@ -633,7 +633,7 @@ describe("Cursor history encoding", () => {
 			"cursor-composer-2.5",
 			[{ type: "toolCall", id: callId, name: "bash", arguments: { command: "echo first" } }],
 			2,
-			"toolUse",
+			"error",
 		);
 		const result: ToolResultMessage = {
 			role: "toolResult",
@@ -645,6 +645,7 @@ describe("Cursor history encoding", () => {
 		};
 
 		expect(buildResolvedCursorToolResults([assistant, result], "cursor").get(callId)).toBe(result);
+		expect(buildResolvedCursorToolResults([{ ...assistant, stopReason: "toolUse" }, result], "cursor").size).toBe(0);
 		expect(
 			buildResolvedCursorToolResults(
 				[assistant, result, { role: "user", content: "Run a new command", timestamp: 4 }],
