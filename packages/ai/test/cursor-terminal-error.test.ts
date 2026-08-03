@@ -806,6 +806,76 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		expect(thirdPendingCalls).toEqual([JSON.stringify({ toolCallId: "newer-call", toolName: "read" })]);
 	});
 
+	it("preserves the previous checkpoint when a retry fails before a server response", async () => {
+		const firstStarted = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		scenario = { kind: "checkpoint-ownership-race", requests: 0, firstStarted, releaseFirst };
+		const baseUrl = await startServer();
+		const conversationId = "cursor-pre-response-checkpoint";
+		const model = makeModel(baseUrl);
+
+		const older = streamCursor(model, context, { apiKey: "test-token", conversationId });
+		const olderDone = (async () => {
+			for await (const _event of older) {
+				// Drain after the fixture releases this older request.
+			}
+			return await older.result();
+		})();
+		await firstStarted.promise;
+
+		const seed = streamCursor(model, context, {
+			apiKey: "test-token",
+			conversationId,
+			onPayload: payload => {
+				const request = payload as { conversationState?: { rootPromptMessagesJson?: Uint8Array[] } };
+				if (scenario.kind === "checkpoint-ownership-race") {
+					scenario.rootPromptMessagesJson = request.conversationState?.rootPromptMessagesJson;
+				}
+			},
+		});
+		for await (const _event of seed) {
+			// Seed a valid server checkpoint owned by the newer request.
+		}
+		expect((await seed.result()).stopReason).toBe("stop");
+		releaseFirst.resolve();
+		expect((await olderDone).stopReason).toBe("error");
+
+		await stopServer();
+		let failedPendingToolCalls: string[] | undefined;
+		const failed = streamCursor(model, context, {
+			apiKey: "test-token",
+			conversationId,
+			onPayload: payload => {
+				failedPendingToolCalls = (payload as { conversationState?: { pendingToolCalls?: string[] } })
+					.conversationState?.pendingToolCalls;
+			},
+		});
+		for await (const _event of failed) {
+			// The closed listener fails before any response headers arrive.
+		}
+		expect((await failed.result()).stopReason).toBe("error");
+
+		scenario = { kind: "success" };
+		const recoveryBaseUrl = await startServer();
+		let pendingToolCalls: string[] | undefined;
+		const recovery = streamCursor(makeModel(recoveryBaseUrl), context, {
+			apiKey: "test-token",
+			conversationId,
+			onPayload: payload => {
+				pendingToolCalls = (payload as { conversationState?: { pendingToolCalls?: string[] } }).conversationState
+					?.pendingToolCalls;
+			},
+		});
+		for await (const _event of recovery) {
+			// Drain the verification request.
+		}
+		expect((await recovery.result()).stopReason).toBe("stop");
+		expect([failedPendingToolCalls, pendingToolCalls]).toEqual([
+			[JSON.stringify({ toolCallId: "newer-call", toolName: "read" })],
+			[JSON.stringify({ toolCallId: "newer-call", toolName: "read" })],
+		]);
+	});
+
 	it.each(["write", "bash", "edit"] as const)(
 		"reuses a stable ID when an interrupted stream repeats an ID-less Pi %s",
 		async piExec => {

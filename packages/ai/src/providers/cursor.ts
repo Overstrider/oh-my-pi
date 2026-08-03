@@ -503,8 +503,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Settled = false;
 		let sawTurnEnded = false;
 		let completedCleanly = false;
+		let sawServerResponse = false;
 		let conversationId: string | undefined;
 		let conversationStateOwner: object | undefined;
+		let previousConversationStateEntry: ConversationStateCacheEntry | undefined;
 		let endStreamError: Error | null = null;
 		// Reachable from the catch: a stream that dies mid-turn must still close
 		// and pair the blocks it left open, and `state` itself is scoped to the
@@ -544,7 +546,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			conversationStateOwner = requestStateOwner;
 			const blobStore = conversationBlobStores.get(requestConversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(requestConversationId, blobStore);
-			const cachedState = conversationStateCache.get(requestConversationId)?.state;
+			previousConversationStateEntry = conversationStateCache.get(requestConversationId);
+			const cachedState = previousConversationStateEntry?.state;
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
 				conversationId: requestConversationId,
 				blobStore,
@@ -642,6 +645,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			h2Request.on("response", headers => {
+				sawServerResponse = true;
 				debugResponseLogPromise = debugSession?.openResponseLog(
 					`HTTP/2 ${headers[":status"] ?? ""}`.trim(),
 					headers,
@@ -825,8 +829,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				!completedCleanly &&
 				conversationStateCache.get(conversationId)?.owner === conversationStateOwner
 			) {
-				conversationStateCache.delete(conversationId);
-				log("conversationState", "invalidatedAfterInterruptedStream", { conversationId });
+				if (sawServerResponse) {
+					conversationStateCache.delete(conversationId);
+					log("conversationState", "invalidatedAfterInterruptedStream", { conversationId });
+				} else if (previousConversationStateEntry) {
+					conversationStateCache.set(conversationId, previousConversationStateEntry);
+					log("conversationState", "restoredAfterPreResponseFailure", { conversationId });
+				} else {
+					conversationStateCache.delete(conversationId);
+				}
 			}
 			const responseLog = await debugResponseLogPromise;
 			await responseLog?.close();
