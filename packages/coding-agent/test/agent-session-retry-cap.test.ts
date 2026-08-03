@@ -1827,7 +1827,7 @@ describe("AgentSession retry delay cap", () => {
 		expect(session.isRetrying).toBe(false);
 	});
 
-	it("caps resolved Cursor transport continuation at two retries", async () => {
+	it("caps cached resolved Cursor transport continuation at two retries", async () => {
 		const model = createMockModel({ id: "composer-2.5", provider: "cursor" });
 		authStorage.setRuntimeApiKey("cursor", "cursor-test-key");
 		let streamCalls = 0;
@@ -1835,8 +1835,8 @@ describe("AgentSession retry delay cap", () => {
 			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 			streamFn: (_requestedModel, _context, options) => {
-				streamCalls++;
-				const callId = `cursor-read-${streamCalls}`;
+				const attempt = ++streamCalls;
+				const callId = "cursor-read-cached";
 				const toolCall = {
 					type: "toolCall" as const,
 					id: callId,
@@ -1846,17 +1846,9 @@ describe("AgentSession retry delay cap", () => {
 				};
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(async () => {
-					await options?.cursorOnToolResult?.({
-						role: "toolResult",
-						toolCallId: callId,
-						toolName: "read",
-						content: [{ type: "text", text: "file body" }],
-						isError: false,
-						timestamp: Date.now(),
-					});
 					const partial: AssistantMessage = {
 						role: "assistant",
-						content: [toolCall],
+						content: attempt === 1 ? [toolCall] : [],
 						api: model.api,
 						provider: model.provider,
 						model: model.id,
@@ -1872,14 +1864,24 @@ describe("AgentSession retry delay cap", () => {
 						timestamp: Date.now(),
 					};
 					stream.push({ type: "start", partial });
-					stream.push({ type: "toolcall_start", contentIndex: 0, partial });
-					stream.push({
-						type: "toolcall_delta",
-						contentIndex: 0,
-						delta: JSON.stringify(toolCall.arguments),
-						partial,
-					});
-					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+					if (attempt === 1) {
+						await options?.cursorOnToolResult?.({
+							role: "toolResult",
+							toolCallId: callId,
+							toolName: "read",
+							content: [{ type: "text", text: "file body" }],
+							isError: false,
+							timestamp: Date.now(),
+						});
+						stream.push({ type: "toolcall_start", contentIndex: 0, partial });
+						stream.push({
+							type: "toolcall_delta",
+							contentIndex: 0,
+							delta: JSON.stringify(toolCall.arguments),
+							partial,
+						});
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial });
+					}
 					stream.push({
 						type: "error",
 						reason: "error",
