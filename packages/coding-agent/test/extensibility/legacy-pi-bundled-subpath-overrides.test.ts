@@ -236,4 +236,10 @@ process.stdout.write(JSON.stringify([
 		// from `y/index.ts`, which Node would not resolve either.
 		expect(keys.has("@oh-my-pi/pi-coding-agent/modes/theme/defaults/index")).toBe(false);
 	});
+
+	it("renders wildcard entries as valid TypeScript on the current platform", async () => {
+		const registry = __renderLegacyPiVirtualModule(await collectBundledPiEntries());
+		const transpiler = new Bun.Transpiler({ loader: "ts" });
+		expect(() => transpiler.transformSync(registry)).not.toThrow();
+	});
 });

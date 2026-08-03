@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- Fixed Windows binary builds generating invalid legacy Pi loader identifiers when recursive wildcard matches used backslash path separators.
 - Fixed Cursor Grok and Composer turns stalling or repeatedly replaying completed tools after transient HTTP/2 and incomplete-stream failures. Safe resolved-tool continuations now cover all transient Cursor transport failures and are bounded to two retries ([#6772](https://github.com/can1357/oh-my-pi/issues/6772)).
 - Fixed template argument substitution (`substituteArgs`) executing recursive placeholder expansion when positional argument values contain literal `$@` or `$ARGUMENTS` tokens.
 - Fixed focused-agent status bar dimming darkening Powerline end caps.
