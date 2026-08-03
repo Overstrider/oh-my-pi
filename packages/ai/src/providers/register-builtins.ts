@@ -221,6 +221,11 @@ const GOOGLE_GEMINI_CLI_LAZY_STREAM_LIMITS: LazyStreamLimits = {
 	defaultFirstEventTimeoutMs: 300_000,
 };
 
+const CURSOR_LAZY_STREAM_LIMITS: LazyStreamLimits = {
+	defaultFirstEventTimeoutMs: 300_000,
+	defaultIdleTimeoutMs: 120_000,
+};
+
 const PROVIDER_HANDLED_STREAM_TIMEOUTS: LazyStreamLimits = {
 	providerHandlesStreamTimeouts: true,
 };
@@ -483,7 +488,7 @@ export const streamOpenAIResponses = createLazyStream(
 	loadOpenAIResponsesProviderModule,
 	PROVIDER_HANDLED_STREAM_TIMEOUTS,
 );
-export const streamCursor = createLazyStream(loadCursorProviderModule);
+export const streamCursor = createLazyStream(loadCursorProviderModule, CURSOR_LAZY_STREAM_LIMITS);
 export const streamDevin = createLazyStream(loadDevinProviderModule);
 export const streamOllama = createLazyStream(loadOllamaProviderModule, OPENAI_IDLE_FLOORED_LAZY_STREAM_LIMITS);
 

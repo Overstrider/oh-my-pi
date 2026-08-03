@@ -495,6 +495,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		const h2Completion = Promise.withResolvers<void>();
 		let h2Settled = false;
 		let sawTurnEnded = false;
+		let completedCleanly = false;
+		let conversationId: string | undefined;
 		let endStreamError: Error | null = null;
 		// Reachable from the catch: a stream that dies mid-turn must still close
 		// and pair the blocks it left open, and `state` itself is scoped to the
@@ -528,16 +530,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				throw new AIError.MissingApiKeyError(undefined, "Cursor API key (access token) is required");
 			}
 
-			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
-			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
-			conversationBlobStores.set(conversationId, blobStore);
-			const cachedState = conversationStateCache.get(conversationId);
+			const requestConversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			conversationId = requestConversationId;
+			const blobStore = conversationBlobStores.get(requestConversationId) ?? new Map<string, Uint8Array>();
+			conversationBlobStores.set(requestConversationId, blobStore);
+			const cachedState = conversationStateCache.get(requestConversationId);
 			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
-				conversationId,
+				conversationId: requestConversationId,
 				blobStore,
 				conversationState: cachedState,
 			});
-			conversationStateCache.set(conversationId, conversationState);
+			conversationStateCache.set(requestConversationId, conversationState);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
@@ -601,6 +604,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				},
 				openToolCalls: new Map<string, ToolCallState>(),
 				resolvedMcpToolCallIds,
+				resolvedContextToolResults: buildResolvedCursorToolResults(context.messages, model.provider),
 				get firstTokenTime() {
 					return firstTokenTime;
 				},
@@ -622,7 +626,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			openBlockState = state;
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				conversationStateCache.set(conversationId, checkpoint);
+				conversationStateCache.set(requestConversationId, checkpoint);
 			};
 
 			h2Request.on("response", headers => {
@@ -770,6 +774,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				message: output,
 			});
 			stream.end();
+			completedCleanly = true;
 		} catch (error) {
 			// Same reason as the success path: the Agent finalizes the synthesized
 			// call from this terminal error and clears its Cursor result buffer, so
@@ -802,8 +807,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
-			const log = await debugResponseLogPromise;
-			await log?.close();
+			if (conversationId && !completedCleanly) {
+				conversationStateCache.delete(conversationId);
+				log("conversationState", "invalidatedAfterInterruptedStream", { conversationId });
+			}
+			const responseLog = await debugResponseLogPromise;
+			await responseLog?.close();
 			if (heartbeatTimer) {
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
@@ -842,6 +851,8 @@ export interface BlockState {
 	openToolCalls: Map<string, ToolCallState>;
 	/** MCP call IDs synthesized from exec frames before their redundant streamed block arrives. */
 	resolvedMcpToolCallIds: Set<string>;
+	/** Safely completed Cursor exec calls already present in the canonical request context. */
+	resolvedContextToolResults?: Map<string, ToolResultMessage>;
 	firstTokenTime: number | undefined;
 	setTextBlock: (b: (TextContent & { [kStreamingBlockIndex]: number }) | null) => void;
 	setThinkingBlock: (b: (ThinkingContent & { [kStreamingBlockIndex]: number }) | null) => void;
@@ -859,6 +870,41 @@ export interface BlockState {
 
 function markCursorExecResolved(block: CursorExecResolvedCarrier): void {
 	block[kCursorExecResolved] = true;
+}
+
+function isSafelyReplayableToolResult(result: ToolResultMessage): boolean {
+	if (!result.details || typeof result.details !== "object") return true;
+	const details = result.details as Record<string, unknown>;
+	return details.__synthetic !== true && details.__interrupted !== true && details.executed !== false;
+}
+
+function buildResolvedCursorToolResults(messages: Message[], provider: string): Map<string, ToolResultMessage> {
+	const cursorCalls = new Map<string, string>();
+	const results = new Map<string, ToolResultMessage>();
+	for (const message of messages) {
+		if (message.role === "assistant" && message.api === "cursor-agent" && message.provider === provider) {
+			for (const block of message.content) {
+				if (block.type === "toolCall") cursorCalls.set(block.id, block.name);
+			}
+			continue;
+		}
+		if (message.role !== "toolResult" || !isSafelyReplayableToolResult(message)) continue;
+		const toolName = cursorCalls.get(message.toolCallId);
+		if (toolName === message.toolName) results.set(message.toolCallId, message);
+	}
+	return results;
+}
+
+type CursorExecResolution = CursorExecPairing & {
+	previousResult?: ToolResultMessage;
+};
+
+function cursorExecResolution(state: BlockState, toolCallId: string, toolName: string): CursorExecResolution {
+	return {
+		toolCallId,
+		toolName,
+		previousResult: state.resolvedContextToolResults?.get(toolCallId),
+	};
 }
 
 export interface UsageState {
@@ -1001,6 +1047,7 @@ async function handleShellStreamArgs(
 	h2Request: http2.ClientHttp2Stream,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
+	state: BlockState,
 ): Promise<void> {
 	const normalizedWorkingDirectory = args.workingDirectory || process.cwd();
 	const normalizedArgs: ShellArgs = { ...args, workingDirectory: normalizedWorkingDirectory };
@@ -1123,7 +1170,7 @@ async function handleShellStreamArgs(
 			buildShellRejectedResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, reason),
 		error =>
 			buildShellFailureResult((normalizedArgs as any).command, (normalizedArgs as any).workingDirectory, error),
-		{ toolCallId: args.toolCallId, toolName: "bash" },
+		cursorExecResolution(state, args.toolCallId, "bash"),
 	);
 
 	// When using the batch handler (no shellStream), send buffered stdout/stderr
@@ -1324,7 +1371,7 @@ async function handleExecServerMessage(
 					),
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
-				{ toolCallId: args.toolCallId, toolName: "read" },
+				cursorExecResolution(state, args.toolCallId, "read"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
 			return;
@@ -1343,7 +1390,7 @@ async function handleExecServerMessage(
 				toolResult => buildLsResultFromToolResult(args.path, toolResult),
 				reason => buildLsRejectedResult(args.path, reason),
 				error => buildLsErrorResult(args.path, error),
-				{ toolCallId: args.toolCallId, toolName: "read" },
+				cursorExecResolution(state, args.toolCallId, "read"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
 			return;
@@ -1379,7 +1426,7 @@ async function handleExecServerMessage(
 				toolResult => buildGrepResultFromToolResult(args, toolResult),
 				reason => buildGrepErrorResult(reason),
 				error => buildGrepErrorResult(error),
-				{ toolCallId: args.toolCallId, toolName: "grep" },
+				cursorExecResolution(state, args.toolCallId, "grep"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "grepResult", execResult);
 			return;
@@ -1409,7 +1456,7 @@ async function handleExecServerMessage(
 					),
 				reason => buildWriteRejectedResult(args.path, reason),
 				error => buildWriteErrorResult(args.path, error),
-				{ toolCallId: args.toolCallId, toolName: "write" },
+				cursorExecResolution(state, args.toolCallId, "write"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
 			return;
@@ -1425,7 +1472,7 @@ async function handleExecServerMessage(
 				toolResult => buildDeleteResultFromToolResult(args.path, toolResult),
 				reason => buildDeleteRejectedResult(args.path, reason),
 				error => buildDeleteErrorResult(args.path, error),
-				{ toolCallId: args.toolCallId, toolName: "delete" },
+				cursorExecResolution(state, args.toolCallId, "delete"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
 			return;
@@ -1449,7 +1496,7 @@ async function handleExecServerMessage(
 				toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
 				reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
 				error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
-				{ toolCallId: args.toolCallId, toolName: "bash" },
+				cursorExecResolution(state, args.toolCallId, "bash"),
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
@@ -1464,7 +1511,7 @@ async function handleExecServerMessage(
 				cwd: args.workingDirectory || undefined,
 				timeout: shellStreamTimeout,
 			});
-			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult);
+			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult, state);
 			return;
 		}
 		case "backgroundShellSpawnArgs": {
@@ -1525,7 +1572,7 @@ async function handleExecServerMessage(
 				toolResult => buildDiagnosticsResultFromToolResult(args.path, toolResult),
 				reason => buildDiagnosticsRejectedResult(args.path, reason),
 				error => buildDiagnosticsErrorResult(args.path, error),
-				{ toolCallId: args.toolCallId, toolName: "lsp" },
+				cursorExecResolution(state, args.toolCallId, "lsp"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "diagnosticsResult", execResult);
 			return;
@@ -1588,7 +1635,7 @@ async function handleExecServerMessage(
 				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
 				_reason => buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
-				execHandlers?.mcp ? { toolCallId: mcpCall.toolCallId, toolName: mcpCall.toolName } : null,
+				execHandlers?.mcp ? cursorExecResolution(state, mcpCall.toolCallId, mcpCall.toolName) : null,
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;
@@ -1789,7 +1836,7 @@ async function handleExecServerMessage(
 				buildPiReadResult,
 				buildPiReadError,
 				buildPiReadError,
-				{ toolCallId, toolName: "read" },
+				cursorExecResolution(state, toolCallId, "read"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "piReadResult", execResult);
 			return;
@@ -1808,7 +1855,7 @@ async function handleExecServerMessage(
 				buildPiBashResult,
 				buildPiBashError,
 				buildPiBashError,
-				{ toolCallId, toolName: "bash" },
+				cursorExecResolution(state, toolCallId, "bash"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "piBashResult", execResult);
 			return;
@@ -1829,7 +1876,7 @@ async function handleExecServerMessage(
 				buildPiEditResult,
 				buildPiEditRejected,
 				buildPiEditError,
-				{ toolCallId, toolName: "edit" },
+				cursorExecResolution(state, toolCallId, "edit"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "piEditResult", execResult);
 			return;
@@ -1848,7 +1895,7 @@ async function handleExecServerMessage(
 				buildPiWriteResult,
 				buildPiWriteRejected,
 				buildPiWriteError,
-				{ toolCallId, toolName: "write" },
+				cursorExecResolution(state, toolCallId, "write"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "piWriteResult", execResult);
 			return;
@@ -1875,7 +1922,7 @@ async function handleExecServerMessage(
 				buildPiGrepResult,
 				buildPiGrepError,
 				buildPiGrepError,
-				{ toolCallId, toolName: "grep" },
+				cursorExecResolution(state, toolCallId, "grep"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "piGrepResult", execResult);
 			return;
@@ -1894,7 +1941,7 @@ async function handleExecServerMessage(
 				buildPiFindResult,
 				buildPiFindError,
 				buildPiFindError,
-				{ toolCallId, toolName: "glob" },
+				cursorExecResolution(state, toolCallId, "glob"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "piFindResult", execResult);
 			return;
@@ -1913,7 +1960,7 @@ async function handleExecServerMessage(
 				buildPiLsResult,
 				buildPiLsError,
 				buildPiLsError,
-				{ toolCallId, toolName: "read" },
+				cursorExecResolution(state, toolCallId, "read"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "piLsResult", execResult);
 			return;
@@ -1936,7 +1983,7 @@ async function handleExecServerMessage(
 				toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
 				reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
 				error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
-				{ toolCallId: args.toolCallId, toolName: "bash" },
+				cursorExecResolution(state, args.toolCallId, "bash"),
 			);
 			sendExecClientMessage(h2Request, execMsg, "miniSweAgentBashResult", sanitizeShellExecResult(execResult));
 			return;
@@ -2246,8 +2293,22 @@ export async function resolveExecHandler<TArgs, TResult>(
 	buildFromToolResult: (toolResult: ToolResultMessage) => TResult,
 	buildRejected: (reason: string) => TResult,
 	buildError: (error: string) => TResult,
-	pairing: CursorExecPairing | null,
+	pairing: CursorExecResolution | null,
 ): Promise<{ execResult: TResult; toolResult?: ToolResultMessage }> {
+	if (pairing?.previousResult) {
+		if (pairing.previousResult.toolName !== pairing.toolName) {
+			const message = `Cursor repeated tool call ${pairing.toolCallId} as ${pairing.toolName} after it completed as ${pairing.previousResult.toolName}`;
+			log("warn", "conflictingResolvedExecReplay", {
+				toolCallId: pairing.toolCallId,
+				previousToolName: pairing.previousResult.toolName,
+				toolName: pairing.toolName,
+			});
+			return { execResult: buildError(message) };
+		}
+		log("exec", "replayResolvedResult", { toolCallId: pairing.toolCallId, toolName: pairing.toolName });
+		return { execResult: buildFromToolResult(pairing.previousResult) };
+	}
+
 	const pair = async (text: string, isError: boolean): Promise<ToolResultMessage | undefined> => {
 		// `null` only for MCP without a handler: that block is never marked
 		// resolved, so `agent-loop.ts` runs it locally and pairs its own result.
@@ -3578,6 +3639,7 @@ export function synthesizeCursorExecToolCall(
 	toolName: string,
 	args: Record<string, unknown>,
 ): void {
+	if (state.resolvedContextToolResults?.has(toolCallId)) return;
 	endCurrentTextBlock(output, stream, state);
 	endCurrentThinkingBlock(output, stream, state);
 	const block: ToolCallState = {

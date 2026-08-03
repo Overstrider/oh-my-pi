@@ -2,10 +2,17 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as http2 from "node:http2";
 import { create, toBinary } from "@bufbuild/protobuf";
 import { streamCursor } from "@oh-my-pi/pi-ai/providers/cursor";
-import type { Context, CursorToolResultHandler, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
+import type {
+	AssistantMessage,
+	Context,
+	CursorToolResultHandler,
+	Model,
+	ToolResultMessage,
+} from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import {
 	AgentServerMessageSchema,
+	ConversationStateStructureSchema,
 	ExecServerMessageSchema,
 	InteractionUpdateSchema,
 	ReadArgsSchema,
@@ -28,6 +35,8 @@ type Scenario =
 	| { kind: "exec-in-final-chunk"; responseFinished: PromiseWithResolvers<void> }
 	| { kind: "exec-then-transport-error"; responseFinished: PromiseWithResolvers<void> }
 	| { kind: "exec-then-hang" }
+	| { kind: "exec-and-turn" }
+	| { kind: "stale-checkpoint-retry"; requests: number }
 	| { kind: "todo-start-then-death" };
 
 let server: http2.Http2Server | undefined;
@@ -107,6 +116,18 @@ function execRequestFrame(): Buffer {
  */
 function execAndTurnEndedFrame(): Buffer {
 	return Buffer.concat([execRequestFrame(), turnEndedFrame()]);
+}
+
+function staleCheckpointFrame(): Buffer {
+	const message = create(AgentServerMessageSchema, {
+		message: {
+			case: "conversationCheckpointUpdate",
+			value: create(ConversationStateStructureSchema, {
+				pendingToolCalls: [JSON.stringify({ toolCallId: "call-final", toolName: "read" })],
+			}),
+		},
+	});
+	return frameConnectMessage(toBinary(AgentServerMessageSchema, message));
 }
 
 /**
@@ -226,6 +247,24 @@ async function startServer(): Promise<string> {
 			return;
 		}
 
+		if (scenario.kind === "exec-and-turn") {
+			stream.write(execAndTurnEndedFrame());
+			stream.end();
+			return;
+		}
+
+		if (scenario.kind === "stale-checkpoint-retry") {
+			scenario.requests++;
+			if (scenario.requests === 1) {
+				stream.write(Buffer.concat([staleCheckpointFrame(), execRequestFrame()]));
+				stream.end();
+				return;
+			}
+			stream.write(execAndTurnEndedFrame());
+			stream.end();
+			return;
+		}
+
 		stream.write(Buffer.concat([textDeltaFrame("hello"), turnEndedFrame()]));
 
 		if (scenario.kind === "connect-error-after-turn") {
@@ -270,6 +309,36 @@ function makeModel(baseUrl: string): Model<"cursor-agent"> {
 const context: Context = {
 	messages: [{ role: "user", content: "terminal lifecycle", timestamp: 1 }],
 };
+
+function completedCursorToolHistory(toolName: string, details?: unknown): Context {
+	const assistant: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "toolCall", id: "call-final", name: toolName, arguments: {} }],
+		api: "cursor-agent",
+		provider: "cursor",
+		model: "cursor-terminal-fixture",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "error",
+		timestamp: 2,
+	};
+	const result: ToolResultMessage = {
+		role: "toolResult",
+		toolCallId: "call-final",
+		toolName,
+		content: [{ type: "text", text: "prior result" }],
+		details,
+		isError: false,
+		timestamp: 3,
+	};
+	return { messages: [...context.messages, assistant, result] };
+}
 
 async function collectStream(
 	model: Model<"cursor-agent">,
@@ -536,6 +605,137 @@ describe("Cursor terminal lifecycle after turnEnded", () => {
 		expect(eventTypes).not.toContain("done");
 		expect(result.errorMessage).toContain("mid-exec transport failure");
 		expect(paired).toEqual(["call-final"]);
+	});
+
+	it("drops stale pending calls and replays a completed result without executing the tool twice", async () => {
+		scenario = { kind: "stale-checkpoint-retry", requests: 0 };
+		const baseUrl = await startServer();
+		const model = makeModel(baseUrl);
+		const conversationId = "cursor-stale-checkpoint";
+		const payloadPendingCalls: string[][] = [];
+		const paired: ToolResultMessage[] = [];
+		let executions = 0;
+		const execHandlers = {
+			async read() {
+				executions++;
+				return {
+					role: "toolResult" as const,
+					toolCallId: "call-final",
+					toolName: "read",
+					content: [{ type: "text" as const, text: "file body" }],
+					isError: false,
+					timestamp: 1,
+				};
+			},
+		};
+		const capturePayload = (payload: unknown) => {
+			const request = payload as { conversationState?: { pendingToolCalls?: string[] } };
+			payloadPendingCalls.push(request.conversationState?.pendingToolCalls ?? []);
+		};
+
+		const first = streamCursor(model, context, {
+			apiKey: "test-token",
+			conversationId,
+			execHandlers,
+			onPayload: capturePayload,
+			onToolResult: result => {
+				paired.push(result);
+				return result;
+			},
+		});
+		for await (const _event of first) {
+			// Drain the terminal error.
+		}
+		const interrupted = await first.result();
+		expect(interrupted.stopReason).toBe("error");
+		expect(executions).toBe(1);
+		expect(paired).toHaveLength(1);
+
+		const retryContext: Context = {
+			messages: [...context.messages, interrupted, paired[0]],
+		};
+		const replayedResults: ToolResultMessage[] = [];
+		const retry = streamCursor(model, retryContext, {
+			apiKey: "test-token",
+			conversationId,
+			execHandlers,
+			onPayload: capturePayload,
+			onToolResult: result => {
+				replayedResults.push(result);
+				return result;
+			},
+		});
+		for await (const _event of retry) {
+			// Drain the successful retry.
+		}
+		const recovered = await retry.result();
+
+		expect(recovered.stopReason).toBe("stop");
+		expect(payloadPendingCalls).toEqual([[], []]);
+		expect(executions).toBe(1);
+		expect(replayedResults).toEqual([]);
+		expect(recovered.content.some(block => block.type === "toolCall" && block.id === "call-final")).toBe(false);
+	});
+
+	it("executes a repeated call when the prior result says the tool never ran", async () => {
+		scenario = { kind: "exec-and-turn" };
+		const baseUrl = await startServer();
+		let executions = 0;
+		const paired: ToolResultMessage[] = [];
+		const stream = streamCursor(
+			makeModel(baseUrl),
+			completedCursorToolHistory("read", { __synthetic: true, executed: false }),
+			{
+				apiKey: "test-token",
+				execHandlers: {
+					async read() {
+						executions++;
+						return {
+							role: "toolResult",
+							toolCallId: "call-final",
+							toolName: "read",
+							content: [{ type: "text", text: "executed now" }],
+							isError: false,
+							timestamp: 4,
+						};
+					},
+				},
+				onToolResult: result => {
+					paired.push(result);
+					return result;
+				},
+			},
+		);
+		for await (const _event of stream) {
+			// Drain the successful turn.
+		}
+		const result = await stream.result();
+		expect(result.stopReason).toBe("stop");
+		expect(executions).toBe(1);
+		expect(paired).toHaveLength(1);
+		expect(result.content).toContainEqual(expect.objectContaining({ type: "toolCall", id: "call-final" }));
+	});
+
+	it("rejects a repeated tool-call ID whose tool name changed", async () => {
+		scenario = { kind: "exec-and-turn" };
+		const baseUrl = await startServer();
+		let executions = 0;
+		const stream = streamCursor(makeModel(baseUrl), completedCursorToolHistory("write"), {
+			apiKey: "test-token",
+			execHandlers: {
+				async read() {
+					executions++;
+					throw new Error("must not execute");
+				},
+			},
+		});
+		for await (const _event of stream) {
+			// Drain the successful protocol turn.
+		}
+		const result = await stream.result();
+		expect(result.stopReason).toBe("stop");
+		expect(executions).toBe(0);
+		expect(result.content.some(block => block.type === "toolCall" && block.id === "call-final")).toBe(false);
 	});
 
 	it("does not hold the abort hostage to a hung exec handler", async () => {

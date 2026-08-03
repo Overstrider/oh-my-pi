@@ -4,6 +4,7 @@ import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { ApiKeyResolveContext, AssistantMessage, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import * as aiStream from "@oh-my-pi/pi-ai/stream";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
@@ -887,8 +888,11 @@ describe("AgentSession retry delay cap", () => {
 		});
 	});
 
-	it("resumes a stalled Cursor stream after its exec tool result", async () => {
-		const stallMessage = "Provider stream stalled while waiting for the next event";
+	it.each([
+		["watchdog stall", "Provider stream stalled while waiting for the next event"],
+		["incomplete stream", "Cursor stream ended before turnEnded"],
+		["HTTP/2 truncation", "NGHTTP2_INTERNAL_ERROR"],
+	] as const)("resumes a Cursor %s after its exec tool result", async (_case, stallMessage) => {
 		const model = createMockModel({
 			id: "composer-2.5",
 			provider: "cursor",
@@ -966,6 +970,7 @@ describe("AgentSession retry delay cap", () => {
 							...partial,
 							stopReason: "error",
 							errorMessage: stallMessage,
+							errorId: AIError.create(AIError.Flag.Transient),
 						},
 					});
 				});
@@ -1661,6 +1666,64 @@ describe("AgentSession retry delay cap", () => {
 		expect(retryEndEvents).toHaveLength(1);
 		expect(retryEndEvents[0]).toMatchObject({ success: false, attempt: 1 });
 		expect(lastAssistant(session).errorMessage).toBe("server_error: stream closed with reason: error");
+		expect(session.isRetrying).toBe(false);
+	});
+
+	it("caps Cursor transport recovery at two retries", async () => {
+		const model = createMockModel({ id: "composer-2.5", provider: "cursor" });
+		authStorage.setRuntimeApiKey("cursor", "cursor-test-key");
+		const mock = createMockModel({
+			provider: "cursor",
+			responses: [
+				{
+					content: [{ type: "thinking", thinking: "attempt 1" }],
+					stopReason: "error",
+					errorMessage: "502 Bad Gateway",
+				},
+				{
+					content: [{ type: "thinking", thinking: "attempt 2" }],
+					stopReason: "error",
+					errorMessage: "502 Bad Gateway",
+				},
+				{
+					content: [{ type: "thinking", thinking: "attempt 3" }],
+					stopReason: "error",
+					errorMessage: "502 Bad Gateway",
+				},
+				{ content: ["must remain unused"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: requestedModel => `${requestedModel.provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (requestedModel, context, options) => mock.stream(requestedModel, context, options),
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 10,
+			"retry.modelFallback": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+		});
+
+		await session.prompt("Trigger repeated Cursor transport failures");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(3);
+		expect(retryStartEvents).toHaveLength(2);
+		expect(retryStartEvents.at(-1)).toMatchObject({ attempt: 2, maxAttempts: 2 });
+		expect(lastAssistant(session).errorMessage).toBe("502 Bad Gateway");
 		expect(session.isRetrying).toBe(false);
 	});
 

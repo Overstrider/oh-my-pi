@@ -899,7 +899,7 @@ export class TurnRecovery {
 	}
 
 	/**
-	 * Classify a reasonless abort or stream stall whose emitted tool calls all
+	 * Classify a reasonless abort or transient Cursor stream failure whose emitted tool calls all
 	 * have results. The failed assistant/tool-result pair stays in context so
 	 * continuation cannot replay completed side effects; synthetic results tell
 	 * the next turn that an unexecuted call must be reissued.
@@ -918,11 +918,14 @@ export class TurnRecovery {
 			message.stopReason === "error" &&
 			message.errorMessage?.toLowerCase().includes("stream stall") === true &&
 			AIError.retriable(id);
-		if (!reasonlessAbort && !streamStall) return undefined;
+		const cursorTransientStreamFailure =
+			message.stopReason === "error" && message.provider === "cursor" && AIError.retriable(id);
+		const interruptedStream = streamStall || cursorTransientStreamFailure;
+		if (!reasonlessAbort && !interruptedStream) return undefined;
 		if (reasonlessAbort && genericAbort) message.errorId = AIError.create(AIError.Flag.Abort);
 
-		// The Cursor server-execution marker gate applies only to the stream-stall
-		// path: an unmarked/unresolved Cursor block there means the server has not
+		// The Cursor server-execution marker gate applies only to transient stream
+		// failures: an unmarked/unresolved Cursor block there means the server has not
 		// finished executing, so resuming would race it. A reasonless abort instead
 		// ends the turn and the agent loop pairs every un-run call (Cursor's unmarked
 		// `todo`/MCP blocks included) with a synthetic `executed: false` result, so
@@ -932,7 +935,7 @@ export class TurnRecovery {
 		for (const block of message.content) {
 			if (block.type !== "toolCall") continue;
 			if (
-				streamStall &&
+				interruptedStream &&
 				message.provider === "cursor" &&
 				(!(kCursorExecResolved in block) || block[kCursorExecResolved] !== true)
 			) {
@@ -1374,7 +1377,9 @@ export class TurnRecovery {
 		// configured chain.
 		const maxRetries = this.#isOpenRouterThinkingStreamClose(message)
 			? Math.min(retrySettings.maxRetries, 1)
-			: retrySettings.maxRetries;
+			: message.provider === "cursor"
+				? Math.min(retrySettings.maxRetries, 2)
+				: retrySettings.maxRetries;
 		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
 
 		const errorMessage = message.errorMessage || "Unknown error";
