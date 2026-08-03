@@ -389,6 +389,43 @@ describe("Cursor stream teardown", () => {
 
 		expect(paired).toEqual([]);
 	});
+
+	it("does not open a streamed MCP block whose result is already cached", async () => {
+		const output = cursorAssistantMessage();
+		const stream = new AssistantMessageEventStream();
+		const cached = toolResult("cached MCP result", {
+			toolCallId: "mcp-cached",
+			toolName: "docs_lookup",
+		});
+		const state = newBlockState({
+			resolvedContextToolResults: new Map([[cached.toolCallId, cached]]),
+		});
+
+		processInteractionUpdate(
+			{
+				message: {
+					case: "toolCallStarted",
+					value: {
+						callId: "envelope-cached",
+						toolCall: {
+							tool: {
+								case: "mcpToolCall",
+								value: { args: { toolCallId: cached.toolCallId, toolName: cached.toolName } },
+							},
+						},
+					},
+				},
+			},
+			output,
+			stream,
+			state,
+			{ sawTokenDelta: false },
+		);
+
+		expect(output.content).toHaveLength(0);
+		expect(state.openToolCalls).toHaveLength(0);
+		expect(state.currentToolCall).toBeNull();
+	});
 });
 
 describe("Cursor modern exec frames: failure channel", () => {

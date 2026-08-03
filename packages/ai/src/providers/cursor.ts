@@ -3957,6 +3957,14 @@ export function processInteractionUpdate(
 			if (mcpCall) {
 				const args = mcpCall.args || {};
 				const id = args.toolCallId || crypto.randomUUID();
+				if (state.resolvedContextToolResults?.has(id)) {
+					// A retry already has the canonical result for this call. The exec
+					// frame will replay it without emitting another result, so opening a
+					// streamed block here would leave a duplicate card permanently
+					// unpaired in the new assistant turn.
+					log("exec", "skipStreamedResolvedMcpReplay", { toolCallId: id });
+					return;
+				}
 				const resolvedByExec = state.resolvedMcpToolCallIds.delete(id);
 				if (resolvedByExec && output.content.some(block => block.type === "toolCall" && block.id === id)) {
 					return;
