@@ -1701,7 +1701,7 @@ async function handleExecServerMessage(
 			// result or the listing is invisible in the UI and gone from every
 			// rebuilt history. Only synthesized when a handler exists: without
 			// one the frame is a fixed empty answer that executed nothing.
-			const listMcpResources = execHandlers?.listMcpResources;
+			const listMcpResources = execHandlers?.listMcpResources?.bind(execHandlers);
 			const toolCallId = listMcpResources ? stableCursorExecToolCallId(execMsg) : undefined;
 			if (toolCallId) {
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "list_mcp_resources", {
@@ -1748,7 +1748,7 @@ async function handleExecServerMessage(
 			// and absent from every rebuilt history. Only synthesized when a
 			// handler exists: without one the frame is a fixed `not_found` that
 			// executed nothing, and a block would claim work that never happened.
-			const readMcpResource = execHandlers?.readMcpResource;
+			const readMcpResource = execHandlers?.readMcpResource?.bind(execHandlers);
 			const toolCallId = readMcpResource ? stableCursorExecToolCallId(execMsg) : undefined;
 			if (toolCallId && readMcpResource) {
 				synthesizeCursorExecToolCall(output, stream, state, toolCallId, "read_mcp_resource", {

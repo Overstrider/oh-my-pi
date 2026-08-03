@@ -798,6 +798,53 @@ describe("Cursor MCP resource frames answer from the host's servers", () => {
 		expect(results[0].isError).toBe(false);
 	});
 
+	it("preserves the receiver for stateful MCP resource handlers", async () => {
+		const statefulHandlers = {
+			server: "docs",
+			listings: 0,
+			reads: 0,
+			async listMcpResources() {
+				this.listings++;
+				return [{ uri: `${this.server}://readme`, server: this.server }];
+			},
+			async readMcpResource({ uri, downloadPath }: { uri: string; downloadPath?: string }) {
+				this.reads++;
+				return { uri, downloadPath, mimeType: "text/markdown" };
+			},
+		};
+
+		const listing = await dispatchExec(
+			buildExecMessage({
+				case: "listMcpResourcesExecArgs",
+				value: create(ListMcpResourcesExecArgsSchema, { server: "docs" }),
+			}),
+			{ execHandlers: statefulHandlers },
+		);
+		const listingAnswer = soleResult(listing.frames);
+		if (listingAnswer.case !== "listMcpResourcesExecResult") throw new Error(`got ${listingAnswer.case}`);
+		if (listingAnswer.value.result.case !== "success") throw new Error(`got ${listingAnswer.value.result.case}`);
+
+		const reading = await dispatchExec(
+			buildExecMessage({
+				case: "readMcpResourceExecArgs",
+				value: create(ReadMcpResourceExecArgsSchema, {
+					server: "docs",
+					uri: "docs://readme",
+					downloadPath: "assets/readme.md",
+				}),
+			}),
+			{ execHandlers: statefulHandlers },
+		);
+		const readingAnswer = soleResult(reading.frames);
+		if (readingAnswer.case !== "readMcpResourceExecResult") throw new Error(`got ${readingAnswer.case}`);
+		if (readingAnswer.value.result.case !== "success") throw new Error(`got ${readingAnswer.value.result.case}`);
+
+		expect(statefulHandlers.listings).toBe(1);
+		expect(statefulHandlers.reads).toBe(1);
+		expect(listingAnswer.value.result.value.resources.map(resource => resource.uri)).toEqual(["docs://readme"]);
+		expect(readingAnswer.value.result.value.downloadPath).toBe("assets/readme.md");
+	});
+
 	it("replays a completed resource download without writing it twice", async () => {
 		const message = buildExecMessage({
 			case: "readMcpResourceExecArgs",
